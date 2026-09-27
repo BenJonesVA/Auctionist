@@ -116,8 +116,8 @@ function Util.FormatMoney(copper)
 
 	local parts = {}
 	if gold > 0 then table.insert(parts, gold .. "g") end
-	if silver > 0 or gold > 0 then table.insert(parts, silver .. "s") end
-	table.insert(parts, bronze .. "c")
+	if silver > 0 then table.insert(parts, silver .. "s") end
+	if bronze > 0 or #parts == 0 then table.insert(parts, bronze .. "c") end
 
 	local text = table.concat(parts, " ")
 	if negative then text = "-" .. text end
@@ -147,6 +147,37 @@ end
 -- Kept here (rather than inline in PriceDB) so tests can override it.
 function Util.TodayKey(t)
 	return date("%Y%m%d", t)
+end
+
+--------------------------------------------------------------------------
+-- %s-format string matching
+--------------------------------------------------------------------------
+
+--- Build a matcher for a Blizzard "%s"-format global string (e.g.
+-- ERR_AUCTION_WON_S, AUCTION_SOLD_MAIL_SUBJECT) so a runtime string can be
+-- tested against it and the %s payload extracted. Defensive: returns nil
+-- if `fmt` isn't a usable string, so callers can treat a missing/renamed
+-- global as "this one feature is inert", never a load-time crash.
+-- @return function(msg) -> matched (boolean), capture (string or nil)
+function Util.BuildFormatMatcher(fmt)
+	if type(fmt) ~= "string" or fmt == "" then return nil end
+
+	local function esc(s)
+		return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+	end
+
+	local prefix, suffix = fmt:match("^(.-)%%s(.*)$")
+	if not prefix then
+		-- No %s placeholder at all; only an exact match is meaningful.
+		return function(msg) return msg == fmt, nil end
+	end
+
+	local pattern = "^" .. esc(prefix) .. "(.-)" .. esc(suffix) .. "$"
+	return function(msg)
+		if type(msg) ~= "string" then return false, nil end
+		local capture = msg:match(pattern)
+		return capture ~= nil, capture
+	end
 end
 
 return Util

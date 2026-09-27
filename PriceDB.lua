@@ -97,6 +97,27 @@ local function computePercentile(sortedPrices, pct)
 	return sortedPrices[idx]
 end
 
+--- Merge a freshly-committed day-bucket with whatever was already recorded
+-- for that item today. Raw prices from an earlier commit this same day
+-- aren't kept around (that would defeat the point of condensing at all),
+-- so the merge is a sample-count-weighted average of the two p10s rather
+-- than a true recomputed percentile of the combined raw data -- a
+-- reasonable approximation for combining two independent scans of the
+-- same day, and far better than letting the second scan silently erase
+-- the first's contribution to today's bucket.
+local function mergeDayBucket(existing, freshP10, freshMin, freshN)
+	if not existing then
+		return { p10 = freshP10, min = freshMin, n = freshN }
+	end
+	local totalN = existing.n + freshN
+	local mergedP10 = (existing.p10 * existing.n + freshP10 * freshN) / totalN
+	return {
+		p10 = mergedP10,
+		min = math.min(existing.min, freshMin),
+		n = totalN,
+	}
+end
+
 function PriceDB:Commit(scopeKey, staged, dayKey)
 	dayKey = dayKey or Util.TodayKey()
 	local now = time()
@@ -113,11 +134,8 @@ function PriceDB:Commit(scopeKey, staged, dayKey)
 			if data.iconTexture then item.iconTexture = data.iconTexture end
 			item.lastSeen = now
 
-			item.days[dayKey] = {
-				p10 = computePercentile(prices, 0.10),
-				min = prices[1],
-				n = #prices,
-			}
+			item.days[dayKey] = mergeDayBucket(item.days[dayKey],
+				computePercentile(prices, 0.10), prices[1], #prices)
 		end
 	end
 end
@@ -188,6 +206,135 @@ end
 function PriceDB:GetVendorSell(scopeKey, itemKey)
 	local item = self:GetItemEntry(scopeKey, itemKey, false)
 	return item and item.vendorSell or nil
+end
+
+-- GetItemInfo's 11th return (vendor sell price) is nil until the client
+-- has cached that item's info -- very likely already true for anything
+-- an auction link resolves, but not guaranteed. When it's missing, queue
+-- an async resolve: a hidden GameTooltip:SetHyperlink primes the cache,
+-- retried in small batches (never the whole queue at once, which could
+-- be thousands of distinct items deep into a getAll scan) until
+-- GetItemInfo answers.
+local VENDOR_LOOKUP_INTERVAL = 0.2
+local VENDOR_LOOKUP_BATCH = 15
+
+--- Look up (and cache) an item's vendor sell price and item-type string.
+-- Safe to call for every accepted scan row -- a no-op if the sell price is
+-- already known, and resolution for an unknown one happens asynchronously
+-- via OnUpdate. Piggybacks the item-type capture (GetItemInfo's 6th
+-- return) onto the same call, since it's needed for material-class
+-- detection (see IsMaterial below) and comes from the exact same cached
+-- item-info lookup as the sell price -- no separate queue needed.
+function PriceDB:ResolveVendorSell(scopeKey, itemKey, link)
+	if self:GetVendorSell(scopeKey, itemKey) then return end
+
+	local info = { GetItemInfo(link) }
+	local itemType, sellPrice = info[6], info[11]
+	if itemType then
+		self:GetItemEntry(scopeKey, itemKey, true).itemType = itemType
+	end
+	if sellPrice and sellPrice > 0 then
+		self:SetVendorSell(scopeKey, itemKey, sellPrice)
+		return
+	end
+
+	self.pendingVendorLookups = self.pendingVendorLookups or {}
+	for _, q in ipairs(self.pendingVendorLookups) do
+		if q.scopeKey == scopeKey and q.itemKey == itemKey then return end -- already queued
+	end
+	table.insert(self.pendingVendorLookups, { scopeKey = scopeKey, itemKey = itemKey, link = link })
+end
+
+--- Driven from Core.lua's master OnUpdate. Processes a bounded,
+-- round-robin slice of the pending-lookup queue every
+-- VENDOR_LOOKUP_INTERVAL seconds rather than the whole queue every
+-- frame.
+function PriceDB:OnUpdate(elapsed)
+	self:ResolveTradeGoodsLabel()
+
+	local pending = self.pendingVendorLookups
+	if not pending or #pending == 0 then return end
+
+	self.vendorLookupElapsed = (self.vendorLookupElapsed or 0) + elapsed
+	if self.vendorLookupElapsed < VENDOR_LOOKUP_INTERVAL then return end
+	self.vendorLookupElapsed = 0
+
+	if not self.vendorLookupTooltip then
+		local tt = CreateFrame("GameTooltip", "AuctionistVendorScanTooltip", nil, "GameTooltipTemplate")
+		tt:SetOwner(UIParent, "ANCHOR_NONE")
+		self.vendorLookupTooltip = tt
+	end
+
+	local batch = math.min(VENDOR_LOOKUP_BATCH, #pending)
+	local still = {}
+	for i = batch + 1, #pending do
+		table.insert(still, pending[i])
+	end
+	for i = 1, batch do
+		local q = pending[i]
+		local info = { GetItemInfo(q.link) }
+		local itemType, sellPrice = info[6], info[11]
+		if itemType then
+			self:GetItemEntry(q.scopeKey, q.itemKey, true).itemType = itemType
+		end
+		if sellPrice and sellPrice > 0 then
+			self:SetVendorSell(q.scopeKey, q.itemKey, sellPrice)
+		else
+			self.vendorLookupTooltip:SetHyperlink(q.link)
+			table.insert(still, q) -- goes to the back -- round-robin, not starved
+		end
+	end
+	self.pendingVendorLookups = still
+end
+
+--------------------------------------------------------------------------
+-- Material (Trade Goods) classification
+--------------------------------------------------------------------------
+-- "Is this a crafting material" needs to compare an item's itemType string
+-- (GetItemInfo's 6th return, e.g. localized "Trade Goods") against the
+-- right category name -- but that name is locale-dependent and this
+-- project has no verified reference for the exact string, or for which
+-- position "Trade Goods" occupies in GetAuctionItemClasses()'s array (both
+-- would be guesses). Instead, this learns the label at runtime from a
+-- known-Trade-Goods reference item (Copper Ore), the same way Auctionator
+-- resolves item-type-to-class (AuctionatorLocalize.lua's
+-- Atr_ItemType2AuctionClass): read the real API's own answer for a known
+-- item, rather than hardcode an assumption about it.
+local TRADE_GOODS_REFERENCE_ITEM_ID = 2770 -- Copper Ore
+
+--- Learns this client's localized "Trade Goods" item-type string, if not
+-- already known. Cheap/no-op once resolved; called every PriceDB:OnUpdate
+-- tick alongside the vendor-lookup queue.
+function PriceDB:ResolveTradeGoodsLabel()
+	if self.tradeGoodsLabel then return end
+
+	local itemType = select(6, GetItemInfo(TRADE_GOODS_REFERENCE_ITEM_ID))
+	if itemType then
+		self.tradeGoodsLabel = itemType
+		return
+	end
+
+	if not self.tradeGoodsLabelTooltip then
+		local tt = CreateFrame("GameTooltip", "AuctionistTradeGoodsLabelTooltip", nil, "GameTooltipTemplate")
+		tt:SetOwner(UIParent, "ANCHOR_NONE")
+		self.tradeGoodsLabelTooltip = tt
+	end
+	self.tradeGoodsLabelTooltip:SetHyperlink("item:" .. TRADE_GOODS_REFERENCE_ITEM_ID)
+end
+
+function PriceDB:GetItemType(scopeKey, itemKey)
+	local item = self:GetItemEntry(scopeKey, itemKey, false)
+	return item and item.itemType or nil
+end
+
+--- @return true/false once both the item's own type and the reference
+--         label are known, or nil if either isn't resolved yet (callers
+--         must treat nil as "don't know, skip" -- never as "not a
+--         material").
+function PriceDB:IsMaterial(scopeKey, itemKey)
+	local itemType = self:GetItemType(scopeKey, itemKey)
+	if not itemType or not self.tradeGoodsLabel then return nil end
+	return itemType == self.tradeGoodsLabel
 end
 
 --------------------------------------------------------------------------

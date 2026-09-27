@@ -90,26 +90,9 @@ addFailure(ERR_NOT_ENOUGH_MONEY, "surface")
 addFailure(ERR_ITEM_MAX_COUNT, "surface")
 addFailure(ERR_AUCTION_HIGHER_BID, "surface")
 
---- Build a Lua pattern that matches a "%s"-format success string like
--- ERR_AUCTION_WON_S ("You won an auction for %s") against a delivered
--- CHAT_MSG_SYSTEM line. Escapes pattern-magic characters in the literal
--- portions and turns the literal two-character "%s" into a ".*" capture.
-local function buildFormatPattern(fmt)
-	local function esc(s)
-		return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
-	end
-	local prefix, suffix = fmt:match("^(.-)%%s(.*)$")
-	if not prefix then
-		return "^" .. esc(fmt) .. "$"
-	end
-	return "^" .. esc(prefix) .. ".*" .. esc(suffix) .. "$"
-end
-
-local wonPattern
-if type(ERR_AUCTION_WON_S) == "string" then
-	local ok, patt = pcall(buildFormatPattern, ERR_AUCTION_WON_S)
-	if ok then wonPattern = patt end
-end
+-- Matches ERR_AUCTION_WON_S ("You won an auction for %s") against a
+-- delivered CHAT_MSG_SYSTEM line. See Util.BuildFormatMatcher.
+local wonMatcher = Util.BuildFormatMatcher(ERR_AUCTION_WON_S)
 
 --------------------------------------------------------------------------
 -- Entry point
@@ -277,7 +260,7 @@ end
 
 function Buy:OnChatMessage(msg)
 	if self.state ~= "BID_SENT" then return end
-	if msg == ERR_AUCTION_BID_PLACED or (wonPattern and string.find(msg, wonPattern)) then
+	if msg == ERR_AUCTION_BID_PLACED or (wonMatcher and wonMatcher(msg)) then
 		self:Success()
 	end
 end
@@ -307,6 +290,9 @@ end
 
 function Buy:Success()
 	Deals:Remove(self.deal.fingerprint)
+	if Auctionist.Ledger then
+		Auctionist.Ledger:RecordPurchase(Auctionist.PriceDB:ScopeKey(), self.deal)
+	end
 	Auctionist.Arbiter:ReleaseControl()
 	self.resultText = "Bought " .. tostring(self.deal.name) .. " for " .. Util.FormatMoney(self.deal.buyoutTotal)
 	self.resultOk = true

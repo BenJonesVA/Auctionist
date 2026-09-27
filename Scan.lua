@@ -19,9 +19,9 @@ Auctionist.Scan = Scan
 
 local PAGE_SIZE = 50
 
-local WAIT_TIMEOUT_PAGED = 5
+local WAIT_TIMEOUT_PAGED = 10
 local WAIT_TIMEOUT_GETALL = 30
-local MAX_QUERY_RETRIES = 5
+local MAX_QUERY_RETRIES = 8
 
 local MAX_ROW_RETRY_TICKS = 5
 local MAX_DUP_PAGE_RETRIES = 10
@@ -93,6 +93,7 @@ end
 function Scan:ResetRun()
 	self.page = 0
 	self.dayKey = Util.TodayKey()
+	self.scopeKey = PriceDB:ScopeKey()
 	self.staged = {}
 	self.prevPageFingerprints = nil
 	self.dupPageRetries = 0
@@ -101,11 +102,43 @@ function Scan:ResetRun()
 	self.stats = { rowsAccepted = 0, rowsSkipped = 0, pagesProcessed = 0, itemsStaged = 0 }
 end
 
---- Reset to IDLE without committing anything staged so far. Used when the
--- AH frame closes or a scan is deliberately abandoned.
+--- Commit whatever's been staged so far, if anything. Shared by a normal
+-- finish, a user-requested Stop, and every failure path -- a timeout or
+-- too-many-duplicate-pages error deep into a long sweep must not throw
+-- away the (possibly thousands of items') worth of data already gathered.
+function Scan:CommitStaged()
+	if not self.staged or not next(self.staged) then return end
+	local scopeKey = self.scopeKey or PriceDB:ScopeKey()
+	Deals:EvaluateMaterialUndercuts(self.staged, scopeKey)
+	PriceDB:Commit(scopeKey, self.staged, self.dayKey)
+	PriceDB:Prune(scopeKey)
+end
+
+--- Reset to IDLE. Used when the AH frame closes. Commits whatever's
+-- staged so far first -- there's no reason to discard already-gathered
+-- pricing data just because the window closed mid-scan.
 function Scan:Cancel()
+	if self.state ~= "IDLE" and self.state ~= "FAILED" then
+		self:CommitStaged()
+	end
 	self.state = "IDLE"
 	self.pageRows = nil
+end
+
+--- User-requested "Stop Scan". Same as Cancel, but only valid while a
+-- scan is actually running, and reported back to the caller so the UI
+-- can show/hide the button correctly.
+function Scan:Stop()
+	if self.state == "IDLE" or self.state == "FAILED" then
+		return false, "no scan is running"
+	end
+	self:CommitStaged()
+	self.stats.lastScanTime = time()
+	self.stats.lastScanMode = self.mode
+	self.stats.stoppedEarly = true
+	self.state = "IDLE"
+	self.pageRows = nil
+	return true
 end
 
 --------------------------------------------------------------------------
@@ -194,6 +227,7 @@ end
 function Scan:RetryQuery(reason)
 	self.queryRetries = self.queryRetries + 1
 	if self.queryRetries > MAX_QUERY_RETRIES then
+		self:CommitStaged()
 		self.state = "FAILED"
 		self.failureReason = reason
 		return
@@ -269,6 +303,7 @@ function Scan:DoCollectPage()
 	if isDuplicate then
 		self.dupPageRetries = self.dupPageRetries + 1
 		if self.dupPageRetries > MAX_DUP_PAGE_RETRIES then
+			self:CommitStaged()
 			self.state = "FAILED"
 			self.failureReason = "too many duplicate pages from the server"
 			return
@@ -308,14 +343,34 @@ function Scan:DoStagePage()
 						iconTexture = row.iconTexture, prices = {} }
 					self.staged[itemKey] = entry
 					self.stats.itemsStaged = self.stats.itemsStaged + 1
+					-- First sighting of this item this scan: make sure its
+					-- vendor price is known (or queued to become known),
+					-- since Deals:Evaluate below needs it for the vendor-
+					-- flip check and the no-history fallback.
+					PriceDB:ResolveVendorSell(self.scopeKey, itemKey, row.link)
 				end
 				table.insert(entry.prices, unitPrice)
+
+				-- Track the cheapest full row seen this scan for this
+				-- item, so the post-scan materials peer-price undercut
+				-- pass (Deals:EvaluateMaterialUndercuts, called from
+				-- CommitStaged) has enough detail to build a buyable deal
+				-- from it, not just a bare unit-price number.
+				if not entry.cheapestRow or unitPrice < entry.cheapestRow.buyoutPerItem then
+					entry.cheapestRow = {
+						itemID = itemID, suffixID = suffixID, link = row.link,
+						name = row.name, iconTexture = row.iconTexture, count = row.count,
+						buyoutPerItem = unitPrice, buyoutTotal = row.buyoutPrice,
+						owner = row.owner, minBid = row.minBid,
+					}
+				end
 
 				Deals:Evaluate({
 					itemID = itemID, suffixID = suffixID, link = row.link,
 					name = row.name, iconTexture = row.iconTexture,
 					count = row.count, buyoutPerItem = unitPrice,
 					buyoutTotal = row.buyoutPrice, owner = row.owner,
+					minBid = row.minBid,
 				})
 
 				self.stats.rowsAccepted = self.stats.rowsAccepted + 1
@@ -347,9 +402,7 @@ function Scan:DoStagePage()
 end
 
 function Scan:Finish()
-	local scopeKey = PriceDB:ScopeKey()
-	PriceDB:Commit(scopeKey, self.staged, self.dayKey)
-	PriceDB:Prune(scopeKey)
+	self:CommitStaged()
 
 	self.stats.lastScanTime = time()
 	self.stats.lastScanMode = self.mode
@@ -368,7 +421,7 @@ function Scan:GetStatusText()
 		end
 		return "Idle - no scan yet"
 	elseif self.state == "FAILED" then
-		return "Scan failed: " .. tostring(self.failureReason)
+		return "Scan failed: " .. tostring(self.failureReason) .. " (partial results saved)"
 	elseif self.mode == "getall" and (self.state == "QUERY_PENDING" or self.state == "STARTING") then
 		local _, canGetAll = CanSendAuctionQuery()
 		if not canGetAll then

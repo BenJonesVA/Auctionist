@@ -10,5 +10,6 @@ PriceDB.lua
 Deals.lua
 Scan.lua
 Buy.lua
+Ledger.lua
 UI.lua
 Core.lua
