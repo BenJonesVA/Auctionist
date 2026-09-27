@@ -2,9 +2,11 @@
 -- Decides whether a single auction row is "underpriced" relative to the
 -- item's market value (or vendor floor, with no history yet), and keeps
 -- the in-memory list of currently flagged deals that UI.lua renders and
--- Buy.lua acts on. Deals are a snapshot of the current scan, not
--- persisted -- PriceDB is the durable data, this is just "what's on the
--- AH right now that looks worth buying".
+-- Buy.lua acts on. Deals are a snapshot of what scans have actually seen
+-- -- PriceDB is the durable price-history data, this is "what's worth
+-- buying" -- but the list itself now survives a /reload too (see
+-- Init/RestoreFromDB), since entries carry a `seenAt` timestamp the UI
+-- can use to show staleness rather than needing a fresh scan every time.
 
 local _, Auctionist = ...
 local Util = Auctionist.Util
@@ -38,11 +40,121 @@ local MATERIAL_MIN_LISTINGS = 3
 -- price of the rest to count as an undercut worth flagging.
 local MATERIAL_UNDERCUT_DISCOUNT = 0.35
 
+-- How old a flagged deal's last confirmed sighting can be before the UI
+-- should treat it as "stale" (i.e. don't fully trust the price/existence
+-- without re-checking) -- used for the Stale column and the Purge Stale
+-- button. A restored-from-reload deal is exactly as stale as its age.
+local STALE_SECONDS = 20 * 60
+
 Deals.flagged = {}      -- ordered array of flagged deal tables (see Evaluate)
 Deals.flaggedByFingerprint = {} -- fingerprint -> the flagged deal table itself, for this scan's de-dup
+Deals.version = 0        -- bumped on every mutation; UI uses this to know when to redraw
 
---- Compute the buyout-per-item threshold at or below which an auction
--- counts as a deal.
+--------------------------------------------------------------------------
+-- Persistence: survive a /reload without needing a fresh scan first.
+--------------------------------------------------------------------------
+
+--- Called once from Core.lua's PLAYER_LOGIN handler, after PriceDB is
+-- already initialized. Deliberately NOT at ADDON_LOADED -- ScopeKey()
+-- depends on the player's faction, which isn't reliably known that early
+-- (see PriceDB.lua's own ScopeKey comment), and getting that wrong here
+-- would restore into (or later save under) the wrong realm-faction scope.
+function Deals:Init()
+	AuctionistDB.deals = AuctionistDB.deals or {}
+	self.db = AuctionistDB.deals
+	self:RestoreFromDB(PriceDB:ScopeKey())
+end
+
+--- Loads whatever was persisted for this scope back into the live
+-- in-memory list. Entries keep their original `seenAt`, so anything old
+-- enough shows up as stale immediately -- restoring is not the same as
+-- re-confirming.
+function Deals:RestoreFromDB(scopeKey)
+	local saved = self.db and self.db[scopeKey]
+	self.flagged = (saved and saved.flagged) or {}
+	self.flaggedByFingerprint = {}
+	for _, deal in ipairs(self.flagged) do
+		self.flaggedByFingerprint[deal.fingerprint] = deal
+	end
+	self.lastSavedVersion = self.version
+end
+
+--- Writes the current flagged list back to SavedVariables. Cheap to call
+-- often (Core.lua's OnUpdate calls this on a slow timer, only actually
+-- writing when `version` has moved since the last save) since a scan can
+-- mutate the list many times a second.
+function Deals:SaveToDB()
+	if not self.db then return end
+	local scopeKey = PriceDB:ScopeKey()
+	self.db[scopeKey] = self.db[scopeKey] or {}
+	self.db[scopeKey].flagged = self.flagged
+	self.lastSavedVersion = self.version
+end
+
+local SAVE_CHECK_INTERVAL = 5
+
+--- Driven from Core.lua's master OnUpdate.
+function Deals:OnUpdate(elapsed)
+	self.saveCheckElapsed = (self.saveCheckElapsed or 0) + elapsed
+	if self.saveCheckElapsed < SAVE_CHECK_INTERVAL then return end
+	self.saveCheckElapsed = 0
+
+	if self.version ~= self.lastSavedVersion then
+		self:SaveToDB()
+	end
+end
+
+--- @return true/false/nil (nil only if the deal was never actually
+--         confirmed by a scan at all, which shouldn't normally happen).
+function Deals:IsStale(deal)
+	if not deal.seenAt then return true end
+	return (time() - deal.seenAt) > STALE_SECONDS
+end
+
+--- Manual "Purge Stale" button: drops every currently-stale entry.
+function Deals:PurgeStale()
+	local removed = 0
+	for i = #self.flagged, 1, -1 do
+		local deal = self.flagged[i]
+		if self:IsStale(deal) then
+			table.remove(self.flagged, i)
+			self.flaggedByFingerprint[deal.fingerprint] = nil
+			removed = removed + 1
+		end
+	end
+	if removed > 0 then
+		self.version = self.version + 1
+	end
+	return removed
+end
+
+--- Called from Scan:Finish() after a just-completed, unfiltered, full
+-- sweep of the AH (never after a filtered, partial, or stopped-early
+-- scan -- those don't see enough of the AH to safely conclude anything
+-- is gone). Anything not re-confirmed (seenAt bumped) during that sweep
+-- presumably sold, expired, or was moved, and is dropped.
+function Deals:RemoveUnconfirmed(sinceTime)
+	local removed = 0
+	for i = #self.flagged, 1, -1 do
+		local deal = self.flagged[i]
+		if not deal.seenAt or deal.seenAt < sinceTime then
+			table.remove(self.flagged, i)
+			self.flaggedByFingerprint[deal.fingerprint] = nil
+			removed = removed + 1
+		end
+	end
+	if removed > 0 then
+		self.version = self.version + 1
+	end
+	return removed
+end
+
+--------------------------------------------------------------------------
+-- Threshold / record building
+--------------------------------------------------------------------------
+
+--- Compute the per-item threshold at or below which a price (buyout or
+-- bid) counts as a deal.
 -- @param marketValue copper per item, or nil if there's no scan history
 -- @param confidence "none"|"low"|"high" (informational; the formula
 --        itself doesn't currently vary by confidence beyond "none", but
@@ -74,46 +186,59 @@ function Deals:Threshold(marketValue, confidence, vendorFloor)
 	return threshold
 end
 
---- Clear the flagged-deal list. Called at the start of every scan (paged
--- or getAll) so stale deals from a previous scan don't linger after the
--- items they described have sold or changed price.
+--- Clear the flagged-deal list entirely. NOT called automatically at the
+-- start of every scan (that used to blank the list for the scan's whole
+-- duration, which is exactly the "blank until I scan" experience this was
+-- built to avoid) -- it's here for a manual full reset if ever needed.
+-- In-place clearing (not `self.flagged = {}`), so a persisted-table
+-- binding never gets orphaned.
 function Deals:Reset()
-	self.flagged = {}
-	self.flaggedByFingerprint = {}
+	for i = #self.flagged, 1, -1 do
+		table.remove(self.flagged, i)
+	end
+	for k in pairs(self.flaggedByFingerprint) do
+		self.flaggedByFingerprint[k] = nil
+	end
+	self.version = self.version + 1
 end
 
 --- Shared by Evaluate() and FlagMaterialUndercut(): computes every display/
 -- decision field for a row (market value, vendor-flip flags, fingerprint)
 -- without deciding whether it qualifies as a deal or inserting it anywhere.
+-- `row.buyoutPerItem`/`row.buyoutTotal` are nil for a bid-only auction
+-- (no buyout set) -- every buyout-dependent field below tolerates that.
 local function buildRecord(itemKey, row)
 	local scopeKey = PriceDB:ScopeKey()
 	local marketValue, confidence, vendorFloor = PriceDB:GetMarketValue(scopeKey, itemKey)
 
-	-- Vendor-price arbitrage is its own always-on check, independent of
-	-- market history/confidence: a buyout below what a vendor pays is a
-	-- guaranteed-profit flip the moment you buy it, no resale timing risk
-	-- at all. Strictly less-than, not less-or-equal -- a buyout exactly
-	-- equal to the vendor price is a real 0-copper-profit break-even, not
-	-- an actual flip, and shouldn't be tagged as one.
-	local isVendorFlip = vendorFloor ~= nil and row.buyoutPerItem < vendorFloor
+	local hasBuyout = row.buyoutPerItem ~= nil and row.buyoutPerItem > 0
 
-	-- Minimum bid vs. vendor: informational only. Winning at the opening
-	-- bid isn't guaranteed (someone else can outbid you), and our Buy
-	-- engine only ever acts on a buyout, so this never changes whether a
-	-- row is flagged -- it's a hint worth surfacing per the "buyout AND
-	-- list price" request, not a buyable deal on its own.
+	-- Vendor-price arbitrage is its own always-on check, independent of
+	-- market history/confidence: a price below what a vendor pays is a
+	-- guaranteed-profit flip the moment you buy it, no resale timing risk
+	-- at all. Strictly less-than, not less-or-equal -- exactly equal to
+	-- the vendor price is a real 0-copper-profit break-even, not an
+	-- actual flip, and shouldn't be tagged as one.
+	local isVendorFlip = hasBuyout and vendorFloor ~= nil and row.buyoutPerItem < vendorFloor
+
+	-- row.minBid, as passed in from Scan.lua, is already "the price you'd
+	-- actually need to bid right now to take the lead" (bidAmount +
+	-- minIncrement once someone's bid, the original minBid otherwise) --
+	-- not necessarily the auction's original starting bid.
 	local minBidPerItem = (row.minBid and row.count and row.count > 0)
 		and math.floor(row.minBid / row.count) or nil
 	local isVendorFlipBid = vendorFloor ~= nil and minBidPerItem ~= nil and minBidPerItem < vendorFloor
 
-	local discountPct = marketValue and (1 - (row.buyoutPerItem / (marketValue * AH_CUT))) or nil
+	local discountPct = (hasBuyout and marketValue) and (1 - (row.buyoutPerItem / (marketValue * AH_CUT))) or nil
+	local bidDiscountPct = (minBidPerItem and marketValue) and (1 - (minBidPerItem / (marketValue * AH_CUT))) or nil
 
 	-- De-dupe within this scan: the same physical auction can be seen
 	-- more than once (a retried duplicate page, or an item appearing on
 	-- more than one page boundary during a getAll). Fingerprint on
-	-- everything that would make two sightings "the same auction".
+	-- everything that would make two sightings "the same auction". A
+	-- bid-only row has no buyout to key on, so minBid substitutes.
 	local fingerprint = table.concat({
-		itemKey, row.link, row.count, row.buyoutPerItem, row.owner or "?",
+		itemKey, row.link, row.count, row.buyoutPerItem or ("bid" .. tostring(row.minBid)), row.owner or "?",
 	}, "|")
 
 	return {
@@ -127,50 +252,83 @@ local function buildRecord(itemKey, row)
 		count = row.count,
 		buyoutPerItem = row.buyoutPerItem,
 		buyoutTotal = row.buyoutTotal,
+		minBid = row.minBid,
+		minBidPerItem = minBidPerItem,
 		owner = row.owner,
 		marketValue = marketValue,
 		confidence = confidence or "none",
 		discountPct = discountPct,
+		bidDiscountPct = bidDiscountPct,
 		vendorFloor = vendorFloor,
 		isVendorFlip = isVendorFlip,
-		minBidPerItem = minBidPerItem,
 		isVendorFlipBid = isVendorFlipBid,
 	}
 end
 
---- Estimated copper profit for the whole stack if resold at the best price
--- basis currently available, cheapest-to-most-speculative:
---   1. Vendor flip: guaranteed -- vendor payout minus cost, no AH cut (you
---      don't pay the auction house's cut selling to a vendor).
---   2. Historical market value: expected -- resale at the recency-weighted
---      average price, minus the AH's cut.
---   3. Peer reference price (materials undercut, no history yet): a
---      same-scan estimate of "what everyone else is currently asking,"
---      minus the AH's cut.
--- Returns nil if none of the three are available (shouldn't normally
--- happen for anything that got flagged at all, but Threshold() and the
--- materials-undercut path are evaluated independently, so this stays
--- defensive rather than assuming one of the three is always set).
+--- The per-item resale price to judge profit against, cheapest-to-most-
+-- speculative: for a materials-undercut record, the same-scan peer
+-- reference price is the whole basis that flagged it in the first place,
+-- so it takes priority over a historical market value here -- an
+-- unrelated, thin/stale marketValue (e.g. from a single old outlier day)
+-- must never override the very comparison that made this look like a
+-- deal. Otherwise, historical market value if there's any history, else
+-- the peer reference price (e.g. a materials-undercut record that also
+-- happens to have no separate marketValue at all).
+local function resaleBasis(record)
+	if record.isMaterialUndercut and record.peerReferencePrice then
+		return record.peerReferencePrice * AH_CUT
+	end
+	if record.marketValue then
+		return record.marketValue * AH_CUT
+	end
+	if record.peerReferencePrice then
+		return record.peerReferencePrice * AH_CUT
+	end
+	return nil
+end
+
+--- Estimated copper profit for the whole stack if bought at its buyout
+-- and resold at resaleBasis() above. Vendor flips are guaranteed instead
+-- (vendor payout minus cost, no AH cut -- you don't pay the auction
+-- house's cut selling to a vendor). Returns nil if no resale basis is
+-- available at all.
 local function estimateProfit(record)
+	if not record.buyoutPerItem then return nil end
 	if record.isVendorFlip then
 		return (record.vendorFloor - record.buyoutPerItem) * record.count
 	end
 
-	local perItemResale = record.marketValue and (record.marketValue * AH_CUT)
-		or (record.peerReferencePrice and (record.peerReferencePrice * AH_CUT))
+	local perItemResale = resaleBasis(record)
 	if not perItemResale then return nil end
-
 	return (perItemResale - record.buyoutPerItem) * record.count
 end
 
---- Evaluate one accepted auction row and, if it's a deal, add it to the
--- flagged list. Called by Scan.lua as each row is accepted -- reads only
--- already-committed PriceDB data, never the in-progress scan's own
--- staged samples (see PriceDB.lua header notes / the plan's
--- self-referential-pricing fix).
+--- Same as estimateProfit, but for winning the auction via bid instead of
+-- buyout. This is inherently speculative even when guaranteed-profit-
+-- looking (isVendorFlipBid): someone else can always outbid you before
+-- the auction ends, so winning at all is never certain the way a buyout
+-- is -- UI.lua labels this distinctly ("if won") rather than as a plain
+-- profit figure.
+local function estimateBidProfit(record)
+	if not record.minBidPerItem then return nil end
+	if record.isVendorFlipBid then
+		return (record.vendorFloor - record.minBidPerItem) * record.count
+	end
+
+	local perItemResale = resaleBasis(record)
+	if not perItemResale then return nil end
+	return (perItemResale - record.minBidPerItem) * record.count
+end
+
+--- Evaluate one accepted auction row and, if either its buyout or its
+-- current minimum bid qualifies as a deal, add/update it in the flagged
+-- list. Called by Scan.lua for every row with a usable link+count,
+-- buyout-having or bid-only alike -- reads only already-committed PriceDB
+-- data, never the in-progress scan's own staged samples (see PriceDB.lua
+-- header notes / the plan's self-referential-pricing fix).
 function Deals:Evaluate(row)
 	-- row = { itemID, suffixID, link, name, iconTexture, count,
-	--         buyoutPerItem, buyoutTotal, owner, minBid }
+	--         buyoutPerItem (nil if bid-only), buyoutTotal, owner, minBid }
 	local itemKey = Util.ItemKey(row.itemID, row.suffixID)
 	if not itemKey then return end
 
@@ -178,13 +336,62 @@ function Deals:Evaluate(row)
 	local marketValue, confidence, vendorFloor = PriceDB:GetMarketValue(scopeKey, itemKey)
 	local threshold = self:Threshold(marketValue, confidence, vendorFloor)
 	if not threshold then return end
-	if row.buyoutPerItem > threshold then return end
+
+	local minBidPerItem = (row.minBid and row.count and row.count > 0)
+		and math.floor(row.minBid / row.count) or nil
+	local hasBuyout = row.buyoutPerItem ~= nil and row.buyoutPerItem > 0
+
+	local buyoutQualifies = hasBuyout and row.buyoutPerItem <= threshold
+	local bidQualifies = minBidPerItem ~= nil and minBidPerItem <= threshold
+	if not buyoutQualifies and not bidQualifies then return end
 
 	local record = buildRecord(itemKey, row)
-	if self.flaggedByFingerprint[record.fingerprint] then return end
-	record.potentialProfit = estimateProfit(record)
+	local potentialProfit = buyoutQualifies and estimateProfit(record) or nil
+	local bidPotentialProfit = bidQualifies and estimateBidProfit(record) or nil
+
+	-- Threshold() can qualify a row purely because the vendor floor
+	-- pushed the cutoff up, without the resale math actually clearing a
+	-- profit (e.g. the vendor price exceeds what the item currently
+	-- fetches on the AH) -- never flag/show something we'd actually take
+	-- a loss on just because some threshold technically passed.
+	if buyoutQualifies and (not potentialProfit or potentialProfit <= 0) then
+		buyoutQualifies, potentialProfit = false, nil
+	end
+	if bidQualifies and (not bidPotentialProfit or bidPotentialProfit <= 0) then
+		bidQualifies, bidPotentialProfit = false, nil
+	end
+
+	local existing = self.flaggedByFingerprint[record.fingerprint]
+	if not buyoutQualifies and not bidQualifies then
+		-- No longer actually profitable either way -- if this was
+		-- previously flagged (e.g. market value shifted since), drop it
+		-- rather than leave a stale, no-longer-valid entry in the list.
+		if existing then self:Remove(record.fingerprint) end
+		return
+	end
+
+	if existing then
+		-- Already flagged (from an earlier row this same scan, or
+		-- restored from before a reload) -- refresh it in place rather
+		-- than inserting a duplicate.
+		existing.buyoutQualifies = buyoutQualifies
+		existing.bidQualifies = bidQualifies
+		existing.potentialProfit = potentialProfit
+		existing.bidPotentialProfit = bidPotentialProfit
+		existing.seenAt = time()
+		self.version = self.version + 1
+		return
+	end
+
+	record.buyoutQualifies = buyoutQualifies
+	record.bidQualifies = bidQualifies
+	record.potentialProfit = potentialProfit
+	record.bidPotentialProfit = bidPotentialProfit
+	record.seenAt = time()
+
 	self.flaggedByFingerprint[record.fingerprint] = record
 	table.insert(self.flagged, record)
+	self.version = self.version + 1
 end
 
 --- Flags a row as a materials peer-price undercut: not compared against
@@ -192,16 +399,26 @@ end
 -- currently asking for the same item in this same scan (see
 -- EvaluateMaterialUndercuts below). If the row already got flagged via the
 -- normal historical-value path, this just adds the tag to the existing
--- record rather than inserting a second copy.
+-- record rather than inserting a second copy. Always buyout-based --
+-- EvaluateMaterialUndercuts only ever compares buyout listings.
 function Deals:FlagMaterialUndercut(row, peerReferencePrice, peerDiscountPct)
 	local itemKey = Util.ItemKey(row.itemID, row.suffixID)
 	if not itemKey then return end
 
-	local record = buildRecord(itemKey, row)
-	local existing = self.flaggedByFingerprint[record.fingerprint]
-	if existing then
-		record = existing
-	else
+	-- Build a scratch record first to check the actual resale math before
+	-- touching anything -- the peer-comparison discount alone doesn't
+	-- guarantee a real profit (e.g. an unrelated, thinner historical
+	-- market value can still undercut it; see resaleBasis()'s priority
+	-- fix, which should prevent this, but never trust it blindly).
+	local candidate = buildRecord(itemKey, row)
+	candidate.isMaterialUndercut = true
+	candidate.peerReferencePrice = peerReferencePrice
+	local profit = estimateProfit(candidate)
+	if not profit or profit <= 0 then return end
+
+	local existing = self.flaggedByFingerprint[candidate.fingerprint]
+	local record = existing or candidate
+	if not existing then
 		self.flaggedByFingerprint[record.fingerprint] = record
 		table.insert(self.flagged, record)
 	end
@@ -209,7 +426,10 @@ function Deals:FlagMaterialUndercut(row, peerReferencePrice, peerDiscountPct)
 	record.isMaterialUndercut = true
 	record.peerReferencePrice = peerReferencePrice
 	record.peerDiscountPct = peerDiscountPct
-	record.potentialProfit = estimateProfit(record)
+	record.buyoutQualifies = true
+	record.potentialProfit = profit
+	record.seenAt = time()
+	self.version = self.version + 1
 end
 
 local function median(sorted)
@@ -296,6 +516,7 @@ function Deals:Remove(fingerprint)
 		if deal.fingerprint == fingerprint then
 			table.remove(self.flagged, i)
 			self.flaggedByFingerprint[fingerprint] = nil
+			self.version = self.version + 1
 			return
 		end
 	end

@@ -94,6 +94,7 @@ function Scan:ResetRun()
 	self.page = 0
 	self.dayKey = Util.TodayKey()
 	self.scopeKey = PriceDB:ScopeKey()
+	self.startedAt = time()
 	self.staged = {}
 	self.prevPageFingerprints = nil
 	self.dupPageRetries = 0
@@ -252,7 +253,7 @@ function Scan:DoCollectPage()
 
 	for n = 1, math.min(budget, #self.pendingIndexes) do
 		local i = self.pendingIndexes[n]
-		local name, texture, count, quality, _, _, minBid, _, buyoutPrice, bidAmount, _, owner =
+		local name, texture, count, quality, _, _, minBid, minIncrement, buyoutPrice, bidAmount, highBidder, owner =
 			GetAuctionItemInfo("list", i)
 		local link = GetAuctionItemLink("list", i)
 
@@ -261,8 +262,9 @@ function Scan:DoCollectPage()
 		if complete then
 			self.pageRows[i] = {
 				link = link, name = name, iconTexture = texture, count = count,
-				quality = quality, minBid = minBid, buyoutPrice = buyoutPrice,
-				bidAmount = bidAmount, owner = owner,
+				quality = quality, minBid = minBid, minIncrement = minIncrement,
+				buyoutPrice = buyoutPrice, bidAmount = bidAmount, highBidder = highBidder,
+				owner = owner,
 				fingerprint = fingerprintRow(name, count, minBid, buyoutPrice, bidAmount),
 			}
 		else
@@ -331,46 +333,63 @@ function Scan:DoStagePage()
 
 	for i = self.stageCursor, last do
 		local row = self.pageRows[i]
-		if row and row.link and row.buyoutPrice and row.buyoutPrice > 0 and row.count then
+		-- highBidder means the player is already the top bidder on this
+		-- listing -- nothing useful to flag or re-bid on there.
+		if row and row.link and row.count and not row.highBidder then
 			local itemID, _, suffixID = Util.ParseItemLink(row.link)
 			if itemID then
 				local itemKey = Util.ItemKey(itemID, suffixID)
-				local unitPrice = math.floor(row.buyoutPrice / row.count)
+				-- Safe to call for every accepted row (buyout or bid-only
+				-- alike) -- it's a no-op once known, and Deals:Evaluate
+				-- below needs it either way for the vendor-flip check.
+				PriceDB:ResolveVendorSell(self.scopeKey, itemKey, row.link)
 
-				local entry = self.staged[itemKey]
-				if not entry then
-					entry = { itemID = itemID, suffixID = suffixID, name = row.name,
-						iconTexture = row.iconTexture, prices = {} }
-					self.staged[itemKey] = entry
-					self.stats.itemsStaged = self.stats.itemsStaged + 1
-					-- First sighting of this item this scan: make sure its
-					-- vendor price is known (or queued to become known),
-					-- since Deals:Evaluate below needs it for the vendor-
-					-- flip check and the no-history fallback.
-					PriceDB:ResolveVendorSell(self.scopeKey, itemKey, row.link)
-				end
-				table.insert(entry.prices, unitPrice)
+				local hasBuyout = row.buyoutPrice and row.buyoutPrice > 0
+				local unitPrice = hasBuyout and math.floor(row.buyoutPrice / row.count) or nil
 
-				-- Track the cheapest full row seen this scan for this
-				-- item, so the post-scan materials peer-price undercut
-				-- pass (Deals:EvaluateMaterialUndercuts, called from
-				-- CommitStaged) has enough detail to build a buyable deal
-				-- from it, not just a bare unit-price number.
-				if not entry.cheapestRow or unitPrice < entry.cheapestRow.buyoutPerItem then
-					entry.cheapestRow = {
-						itemID = itemID, suffixID = suffixID, link = row.link,
-						name = row.name, iconTexture = row.iconTexture, count = row.count,
-						buyoutPerItem = unitPrice, buyoutTotal = row.buyoutPrice,
-						owner = row.owner, minBid = row.minBid,
-					}
+				-- "Next required bid": once someone's already bid, minBid
+				-- no longer reflects what YOU would need to bid to take
+				-- the lead -- that's bidAmount + minIncrement instead.
+				local nextBid = (row.bidAmount and row.bidAmount > 0)
+					and (row.bidAmount + (row.minIncrement or 0))
+					or row.minBid
+
+				if hasBuyout then
+					-- Price history and the materials-undercut peer
+					-- comparison stay buyout-only: a minimum bid isn't a
+					-- real asking price, just wherever the auction
+					-- happened to start, and letting a 0-ish bid-only
+					-- "price" into either would corrupt both.
+					local entry = self.staged[itemKey]
+					if not entry then
+						entry = { itemID = itemID, suffixID = suffixID, name = row.name,
+							iconTexture = row.iconTexture, prices = {} }
+						self.staged[itemKey] = entry
+						self.stats.itemsStaged = self.stats.itemsStaged + 1
+					end
+					table.insert(entry.prices, unitPrice)
+
+					-- Track the cheapest full row seen this scan for this
+					-- item, so the post-scan materials peer-price undercut
+					-- pass (Deals:EvaluateMaterialUndercuts, called from
+					-- CommitStaged) has enough detail to build a buyable
+					-- deal from it, not just a bare unit-price number.
+					if not entry.cheapestRow or unitPrice < entry.cheapestRow.buyoutPerItem then
+						entry.cheapestRow = {
+							itemID = itemID, suffixID = suffixID, link = row.link,
+							name = row.name, iconTexture = row.iconTexture, count = row.count,
+							buyoutPerItem = unitPrice, buyoutTotal = row.buyoutPrice,
+							owner = row.owner, minBid = nextBid,
+						}
+					end
 				end
 
 				Deals:Evaluate({
 					itemID = itemID, suffixID = suffixID, link = row.link,
 					name = row.name, iconTexture = row.iconTexture,
 					count = row.count, buyoutPerItem = unitPrice,
-					buyoutTotal = row.buyoutPrice, owner = row.owner,
-					minBid = row.minBid,
+					buyoutTotal = hasBuyout and row.buyoutPrice or nil,
+					owner = row.owner, minBid = nextBid,
 				})
 
 				self.stats.rowsAccepted = self.stats.rowsAccepted + 1
@@ -403,6 +422,16 @@ end
 
 function Scan:Finish()
 	self:CommitStaged()
+
+	-- A just-completed, unfiltered, full sweep of the AH saw everything --
+	-- anything flagged that wasn't re-confirmed during it (Deals.Evaluate
+	-- bumps seenAt on every sighting) is presumably sold, expired, or
+	-- moved. Never run this after a filtered scan (StartPaged(filters)),
+	-- which only ever looked at a subset and can't safely conclude
+	-- anything outside it is gone.
+	if not next(self.filters) then
+		Deals:RemoveUnconfirmed(self.startedAt)
+	end
 
 	self.stats.lastScanTime = time()
 	self.stats.lastScanMode = self.mode

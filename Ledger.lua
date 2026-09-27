@@ -45,15 +45,35 @@ end
 --------------------------------------------------------------------------
 
 --- Called from Buy:Success() with the deal that was just bought.
-function Ledger:RecordPurchase(scopeKey, deal)
+-- `actualCost`, if given, overrides deal.buyoutTotal -- needed for the
+-- rare case of winning outright via a bid rather than a buyout, where
+-- what was actually paid is the armed bid amount, not the (possibly nil,
+-- for a bid-only deal) buyout figure.
+function Ledger:RecordPurchase(scopeKey, deal, actualCost)
 	local data = self:ScopeData(scopeKey, true)
 	local entry = {
 		id = data.nextId,
 		itemKey = deal.itemKey, itemID = deal.itemID, suffixID = deal.suffixID,
 		name = deal.name, iconTexture = deal.iconTexture, count = deal.count,
-		cost = deal.buyoutTotal, boughtAt = time(),
+		cost = actualCost or deal.buyoutTotal, boughtAt = time(),
 		status = "unsold", saleAmount = nil, soldAt = nil,
 	}
+
+	-- A vendor flip's "sale" isn't something we wait on another player
+	-- for: selling it to any vendor for the price already known at
+	-- purchase time is entirely up to us and guaranteed to work, unlike a
+	-- normal AH resale. No "auction sold" mail will ever arrive for an
+	-- item sold to a vendor, so leaving these "unsold" would mean they
+	-- never close out at all -- count the guaranteed vendor payout as
+	-- realized the moment it's bought instead. Status is "vendored"
+	-- (not "sold") so it's still visually distinct from an actual
+	-- mailbox-confirmed AH sale.
+	if deal.isVendorFlip and deal.vendorFloor then
+		entry.status = "vendored"
+		entry.saleAmount = deal.vendorFloor * deal.count
+		entry.soldAt = entry.boughtAt
+	end
+
 	data.nextId = data.nextId + 1
 	table.insert(data.entries, entry)
 	return entry
@@ -72,7 +92,7 @@ function Ledger:Summary(scopeKey)
 
 	for _, entry in ipairs(self:GetEntries(scopeKey)) do
 		s.totalSpent = s.totalSpent + entry.cost
-		if entry.status == "sold" then
+		if entry.status == "sold" or entry.status == "vendored" then
 			s.totalRevenue = s.totalRevenue + entry.saleAmount
 			s.soldCount = s.soldCount + 1
 		else

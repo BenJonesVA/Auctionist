@@ -55,18 +55,24 @@ local DEAL_SORT_EXTRACTORS = {
 	-- guaranteed vendor flip above everything else, then by whichever
 	-- discount percentage is actually shown.
 	deal = function(d)
-		if d.isVendorFlip then return math.huge end
-		if d.isMaterialUndercut then return d.peerDiscountPct end
-		return d.discountPct
+		if d.buyoutQualifies then
+			if d.isVendorFlip then return math.huge end
+			if d.isMaterialUndercut then return d.peerDiscountPct end
+			return d.discountPct
+		elseif d.bidQualifies then
+			if d.isVendorFlipBid then return math.huge end
+			return d.bidDiscountPct
+		end
+		return nil
 	end,
-	profit = function(d) return d.potentialProfit end,
+	profit = function(d) return d.buyoutQualifies and d.potentialProfit or d.bidPotentialProfit end,
 }
 
 local LEDGER_SORT_EXTRACTORS = {
 	name = function(e) return e.name and e.name:lower() or nil end,
 	cost = function(e) return e.cost end,
-	sale = function(e) return e.status == "sold" and e.saleAmount or nil end,
-	profit = function(e) return e.status == "sold" and (e.saleAmount - e.cost) or nil end,
+	sale = function(e) return (e.status == "sold" or e.status == "vendored") and e.saleAmount or nil end,
+	profit = function(e) return (e.status == "sold" or e.status == "vendored") and (e.saleAmount - e.cost) or nil end,
 }
 
 --------------------------------------------------------------------------
@@ -307,7 +313,11 @@ function UI:CreateDealsPanel()
 	scanBtn:SetSize(100, 22)
 	scanBtn:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, -6)
 	scanBtn:SetText("Scan Now")
-	scanBtn:SetScript("OnClick", function() Auctionist.Scan:StartPaged() end)
+	scanBtn:SetScript("OnClick", function()
+		local filters = {}
+		if UI.selectedClassIndex then filters.classIndex = UI.selectedClassIndex end
+		Auctionist.Scan:StartPaged(filters)
+	end)
 	self.scanButton = scanBtn
 
 	local getAllBtn = CreateFrame("Button", "AuctionistGetAllButton", panel, "UIPanelButtonTemplate")
@@ -343,6 +353,54 @@ function UI:CreateDealsPanel()
 	end)
 	self.vendorFlipOnlyCheck = vendorFlipCheck
 
+	local purgeBtn = CreateFrame("Button", "AuctionistPurgeStaleButton", panel, "UIPanelButtonTemplate")
+	purgeBtn:SetSize(100, 22)
+	purgeBtn:SetPoint("LEFT", vendorFlipCheck, "RIGHT", 170, 0)
+	purgeBtn:SetText("Purge Stale")
+	purgeBtn:SetScript("OnClick", function()
+		local removed = Deals:PurgeStale()
+		print(string.format("Auctionist: purged %d stale deal(s).", removed))
+	end)
+	self.purgeStaleButton = purgeBtn
+
+	-- Category filter: top-level categories only (e.g. "Trade Goods",
+	-- "Armor"), not the full subclass tree -- Scan Now only, since a
+	-- getAll (Full Scan) always sweeps the whole AH by design/API
+	-- constraint and can't be class-filtered. Scan:Finish() already skips
+	-- the auto stale-sweep for any filtered scan (see Scan.lua), so using
+	-- this never wrongly prunes deals outside the chosen category.
+	local categoryDropdown = CreateFrame("Frame", "AuctionistCategoryDropdown", panel, "UIDropDownMenuTemplate")
+	categoryDropdown:SetPoint("LEFT", purgeBtn, "RIGHT", 90, -2)
+	UIDropDownMenu_SetWidth(categoryDropdown, 130)
+	UIDropDownMenu_SetText(categoryDropdown, "All Categories")
+
+	local function OnCategorySelect(entrySelf)
+		UI.selectedClassIndex = entrySelf.value
+		UIDropDownMenu_SetText(categoryDropdown, entrySelf:GetText())
+		CloseDropDownMenus()
+	end
+
+	UIDropDownMenu_Initialize(categoryDropdown, function()
+		local info = UIDropDownMenu_CreateInfo()
+		info.text = "All Categories"
+		info.value = nil
+		info.func = OnCategorySelect
+		UIDropDownMenu_AddButton(info)
+
+		-- GetAuctionItemClasses()'s 1-based position IS the classIndex
+		-- QueryAuctionItems expects (confirmed against Auctionator's own
+		-- Atr_ItemType2AuctionClass/QueryAuctionItems usage) -- top-level
+		-- categories only, no subclass drill-down.
+		for i, name in ipairs({ GetAuctionItemClasses() }) do
+			info = UIDropDownMenu_CreateInfo()
+			info.text = name
+			info.value = i
+			info.func = OnCategorySelect
+			UIDropDownMenu_AddButton(info)
+		end
+	end)
+	self.categoryDropdown = categoryDropdown
+
 	self.dealsSortState = {}
 	self:CreateColumnHeader(panel, -58, {
 		{ x = 22, width = 220, text = "Item", key = "name" },
@@ -350,6 +408,7 @@ function UI:CreateDealsPanel()
 		{ x = 280, width = 100, text = "Buyout", key = "buyoutTotal" },
 		{ x = 384, width = 90, text = "Deal", key = "deal" },
 		{ x = 478, width = 150, text = "Potential Profit", key = "profit" },
+		{ x = 640, width = 50, text = "Age" },
 	}, self.dealsSortState, function() UI:Redisplay() end)
 
 	local scrollFrame = CreateFrame("ScrollFrame", "AuctionistScrollFrame", panel, "FauxScrollFrameTemplate")
@@ -480,12 +539,30 @@ function UI:CreateRow(parent, index, scrollFrame)
 	row.profit:SetWidth(100)
 	row.profit:SetJustifyH("LEFT")
 
-	row.buyButton = CreateFrame("Button", "AuctionistRow" .. index .. "Buy", row, "UIPanelButtonTemplate")
-	row.buyButton:SetSize(50, ROW_HEIGHT - 2)
-	row.buyButton:SetPoint("RIGHT", row, "RIGHT", -2, 0)
-	row.buyButton:SetText("Buy")
-	row.buyButton:SetScript("OnClick", function()
-		if row.deal then UI:OpenBuyDialog(row.deal) end
+	row.stale = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.stale:SetPoint("LEFT", row.profit, "RIGHT", 4, 0)
+	row.stale:SetWidth(50)
+	row.stale:SetJustifyH("LEFT")
+
+	-- Two independent buttons, not one: a listing can qualify as a deal
+	-- via its buyout, its current minimum bid, or both, and each needs
+	-- its own action (see Buy:Start's mode parameter). Anchored
+	-- separately (not chained off each other) so hiding one doesn't
+	-- shift the other.
+	row.bidButton = CreateFrame("Button", "AuctionistRow" .. index .. "Bid", row, "UIPanelButtonTemplate")
+	row.bidButton:SetSize(46, ROW_HEIGHT - 2)
+	row.bidButton:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+	row.bidButton:SetText("Bid")
+	row.bidButton:SetScript("OnClick", function()
+		if row.deal then UI:OpenBuyDialog(row.deal, "bid") end
+	end)
+
+	row.buyoutButton = CreateFrame("Button", "AuctionistRow" .. index .. "Buyout", row, "UIPanelButtonTemplate")
+	row.buyoutButton:SetSize(56, ROW_HEIGHT - 2)
+	row.buyoutButton:SetPoint("RIGHT", row, "RIGHT", -52, 0)
+	row.buyoutButton:SetText("Buyout")
+	row.buyoutButton:SetScript("OnClick", function()
+		if row.deal then UI:OpenBuyDialog(row.deal, "buyout") end
 	end)
 
 	row:Hide()
@@ -553,40 +630,63 @@ function UI:Redisplay()
 			row.icon:SetTexture(deal.iconTexture)
 			row.name:SetText(deal.name or "?")
 			row.count:SetText(tostring(deal.count))
-			row.price:SetText(Util.FormatMoney(deal.buyoutTotal))
-			if deal.isVendorFlip then
-				-- Guaranteed-profit vendor arbitrage: called out distinctly
-				-- and independently of any market-value discount, since it
-				-- carries no resale-timing risk at all.
-				row.discount:SetText(deal.isVendorFlipBid and "Vendor flip!*" or "Vendor flip!")
-				row.discount:SetTextColor(0.15, 1, 0.15)
-			elseif deal.isMaterialUndercut then
-				-- Crafting material priced far below what other sellers
-				-- are currently asking for the same item this scan --
-				-- resale-timing risk still applies (unlike a vendor flip),
-				-- but needs no price history at all to spot.
-				row.discount:SetText(string.format("Material -%d%%",
-					math.floor((deal.peerDiscountPct or 0) * 100 + 0.5)))
-				row.discount:SetTextColor(1, 0.82, 0)
-			elseif deal.discountPct then
-				row.discount:SetText(string.format("%d%% off", math.floor(deal.discountPct * 100 + 0.5)))
-				row.discount:SetTextColor(1, 1, 1)
-			else
-				row.discount:SetText("vendor")
-				row.discount:SetTextColor(1, 1, 1)
-			end
+			row.price:SetText(deal.buyoutTotal and Util.FormatMoney(deal.buyoutTotal) or "no buyout")
 
-			if deal.potentialProfit then
-				row.profit:SetText(Util.FormatMoney(deal.potentialProfit))
-				if deal.potentialProfit >= 0 then
-					row.profit:SetTextColor(0.15, 1, 0.15)
+			if deal.buyoutQualifies then
+				if deal.isVendorFlip then
+					-- Guaranteed-profit vendor arbitrage: called out
+					-- distinctly and independently of any market-value
+					-- discount, since it carries no resale-timing risk at all.
+					row.discount:SetText("Vendor flip!")
+					row.discount:SetTextColor(0.15, 1, 0.15)
+				elseif deal.isMaterialUndercut then
+					-- Crafting material priced far below what other sellers
+					-- are currently asking for the same item this scan --
+					-- resale-timing risk still applies (unlike a vendor
+					-- flip), but needs no price history at all to spot.
+					row.discount:SetText(string.format("Material -%d%%",
+						math.floor((deal.peerDiscountPct or 0) * 100 + 0.5)))
+					row.discount:SetTextColor(1, 0.82, 0)
+				elseif deal.discountPct then
+					row.discount:SetText(string.format("%d%% off", math.floor(deal.discountPct * 100 + 0.5)))
+					row.discount:SetTextColor(1, 1, 1)
 				else
-					row.profit:SetTextColor(1, 0.3, 0.3)
+					row.discount:SetText("vendor")
+					row.discount:SetTextColor(1, 1, 1)
 				end
+				row.profit:SetText(Util.FormatMoney(deal.potentialProfit))
+				row.profit:SetTextColor(0.15, 1, 0.15)
+			elseif deal.bidQualifies then
+				-- No buyout deal here (or its buyout isn't attractive), but
+				-- the current minimum bid is -- distinctly colored and
+				-- labeled "if won" since, unlike a buyout, winning a bid is
+				-- never guaranteed.
+				if deal.isVendorFlipBid then
+					row.discount:SetText("Bid: vendor flip!*")
+				else
+					row.discount:SetText(string.format("Bid: %d%% off",
+						math.floor((deal.bidDiscountPct or 0) * 100 + 0.5)))
+				end
+				row.discount:SetTextColor(0.4, 0.7, 1)
+				row.profit:SetText(Util.FormatMoney(deal.bidPotentialProfit) .. " (if won)")
+				row.profit:SetTextColor(0.4, 0.7, 1)
 			else
+				row.discount:SetText("-")
+				row.discount:SetTextColor(1, 1, 1)
 				row.profit:SetText("-")
 				row.profit:SetTextColor(1, 1, 1)
 			end
+
+			if Deals:IsStale(deal) then
+				row.stale:SetText("Stale")
+				row.stale:SetTextColor(1, 0.5, 0.2)
+			else
+				row.stale:SetText("")
+			end
+
+			if deal.buyoutQualifies then row.buyoutButton:Show() else row.buyoutButton:Hide() end
+			if deal.bidQualifies then row.bidButton:Show() else row.bidButton:Hide() end
+
 			row:Show()
 		else
 			row.deal = nil
@@ -730,8 +830,10 @@ function UI:RedisplayLedger()
 			row.name:SetText((entry.name or "?") .. (entry.count and entry.count > 1 and (" x" .. entry.count) or ""))
 			row.cost:SetText(Util.FormatMoney(entry.cost))
 
-			if entry.status == "sold" then
-				row.sale:SetText(Util.FormatMoney(entry.saleAmount))
+			if entry.status == "sold" or entry.status == "vendored" then
+				local saleText = Util.FormatMoney(entry.saleAmount)
+				if entry.status == "vendored" then saleText = saleText .. " (vendor)" end
+				row.sale:SetText(saleText)
 				local profit = entry.saleAmount - entry.cost
 				row.profit:SetText(Util.FormatMoney(profit))
 				row.profit:SetTextColor(profit >= 0 and 0.15 or 1, profit >= 0 and 1 or 0.3, profit >= 0 and 0.15 or 0.3)
@@ -822,8 +924,9 @@ function UI:CreateBuyDialog()
 	self.buyDialog = dlg
 end
 
-function UI:OpenBuyDialog(deal)
-	local ok, err = Auctionist.Buy:Start(deal)
+--- `mode` is "buyout" (default) or "bid" -- see Buy:Start.
+function UI:OpenBuyDialog(deal, mode)
+	local ok, err = Auctionist.Buy:Start(deal, mode)
 	if not ok then
 		if UIErrorsFrame then
 			UIErrorsFrame:AddMessage(err or "Cannot start purchase", 1, 0.2, 0.2)
@@ -841,16 +944,22 @@ function UI:UpdateBuyDialog()
 
 	local Buy = Auctionist.Buy
 	local state = Buy.state
+	local isBid = Buy.mode == "bid"
 
 	if state == "LOCATING" or state == "WAIT_LOCATE" then
-		dlg.text:SetText("Locating auction...")
+		dlg.text:SetText(isBid and "Locating auction (bid)..." or "Locating auction...")
+		dlg.confirmButton:SetText("Confirm")
 		dlg.confirmButton:Disable()
 	elseif state == "ARMED" then
 		local deal = Buy.deal
-		dlg.text:SetText((deal and deal.name or "?") .. "\n" .. Util.FormatMoney(Buy.armedBuyout))
+		local amount = isBid and Buy.armedMinBid or Buy.armedBuyout
+		dlg.text:SetText((deal and deal.name or "?") .. "\n" ..
+			(isBid and "Bid: " or "Buyout: ") .. Util.FormatMoney(amount) ..
+			(isBid and "\n(not guaranteed -- you can be outbid)" or ""))
+		dlg.confirmButton:SetText(isBid and "Place Bid" or "Confirm")
 		dlg.confirmButton:Enable()
 	elseif state == "BID_SENT" then
-		dlg.text:SetText("Placing bid...")
+		dlg.text:SetText(isBid and "Placing bid..." or "Buying...")
 		dlg.confirmButton:Disable()
 	elseif state == "DONE" or state == "FAILED" then
 		dlg.text:SetText(Buy.resultText or "")

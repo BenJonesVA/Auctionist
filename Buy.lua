@@ -98,13 +98,25 @@ local wonMatcher = Util.BuildFormatMatcher(ERR_AUCTION_WON_S)
 -- Entry point
 --------------------------------------------------------------------------
 
---- Begin trying to buy a flagged deal (a table from Deals.flagged).
-function Buy:Start(deal)
+--- Begin trying to buy or bid on a flagged deal (a table from
+-- Deals.flagged). `mode` is "buyout" (default) or "bid" -- a bid is never
+-- a guaranteed purchase (someone else can always outbid you before the
+-- auction ends), unlike a buyout.
+function Buy:Start(deal, mode)
 	if self.state ~= "IDLE" and self.state ~= "DONE" and self.state ~= "FAILED" then
 		return false, "already busy with another purchase"
 	end
 
+	mode = mode or "buyout"
+	if mode == "buyout" and not deal.buyoutQualifies then
+		return false, "no buyout deal available for this item"
+	end
+	if mode == "bid" and not deal.bidQualifies then
+		return false, "no bid deal available for this item"
+	end
+
 	self.deal = deal
+	self.mode = mode
 	self.locateRetries = 0
 	self.dbErrorRetries = 0
 	self.page = 0
@@ -170,19 +182,31 @@ function Buy:OnAuctionUpdate()
 	local playerName = UnitName("player")
 
 	for i = 1, numBatch do
-		local name, texture, count, _, _, _, _, _, buyoutPrice, _, _, owner = GetAuctionItemInfo("list", i)
+		local name, texture, count, _, _, _, minBid, minIncrement, buyoutPrice, bidAmount, _, owner =
+			GetAuctionItemInfo("list", i)
 		local link = GetAuctionItemLink("list", i)
 
 		if link and buyoutPrice and count then
 			local itemID, _, suffixID = Util.ParseItemLink(link)
 			local key = itemID and Util.ItemKey(itemID, suffixID)
 
-			if key == self.deal.itemKey and count == self.deal.count
-				and buyoutPrice == self.deal.buyoutTotal and owner ~= playerName then
+			local nextBid = (bidAmount and bidAmount > 0) and (bidAmount + (minIncrement or 0)) or minBid
+
+			local matches = key == self.deal.itemKey and count == self.deal.count and owner ~= playerName
+			if matches then
+				if self.mode == "buyout" then
+					matches = buyoutPrice == self.deal.buyoutTotal
+				else
+					matches = nextBid == self.deal.minBid
+				end
+			end
+
+			if matches then
 				self.armedIndex = i
 				self.armedLink = link
 				self.armedCount = count
 				self.armedBuyout = buyoutPrice
+				self.armedMinBid = nextBid
 				self.state = "ARMED"
 				return
 			end
@@ -216,21 +240,29 @@ end
 function Buy:Confirm()
 	if self.state ~= "ARMED" then return false, "nothing armed" end
 
-	local name, _, count, _, _, _, _, _, buyoutPrice = GetAuctionItemInfo("list", self.armedIndex)
+	local name, _, count, _, _, _, minBid, minIncrement, buyoutPrice, bidAmount = GetAuctionItemInfo("list", self.armedIndex)
 	local link = GetAuctionItemLink("list", self.armedIndex)
+	local nextBid = (bidAmount and bidAmount > 0) and (bidAmount + (minIncrement or 0)) or minBid
 
-	if not link or link ~= self.armedLink or count ~= self.armedCount or buyoutPrice ~= self.armedBuyout then
-		-- The listing changed between arming and this click; don't guess,
-		-- go re-find it fresh.
+	if not link or link ~= self.armedLink or count ~= self.armedCount
+		or buyoutPrice ~= self.armedBuyout or nextBid ~= self.armedMinBid then
+		-- The listing changed between arming and this click (someone else
+		-- bid, bought it, etc.) -- don't guess, go re-find it fresh.
 		self.state = "LOCATING"
 		return false, "listing changed, re-locating"
 	end
 
-	if GetMoney() < buyoutPrice then
+	local amount = (self.mode == "bid") and nextBid or buyoutPrice
+	if not amount or amount <= 0 then
+		self.state = "LOCATING"
+		return false, "listing changed, re-locating"
+	end
+
+	if GetMoney() < amount then
 		return false, "not enough money"
 	end
 
-	PlaceAuctionBid("list", self.armedIndex, buyoutPrice)
+	PlaceAuctionBid("list", self.armedIndex, amount)
 	self.state = "BID_SENT"
 	self.bidWaitElapsed = 0
 	return true
@@ -260,8 +292,23 @@ end
 
 function Buy:OnChatMessage(msg)
 	if self.state ~= "BID_SENT" then return end
-	if msg == ERR_AUCTION_BID_PLACED or (wonMatcher and wonMatcher(msg)) then
+	if wonMatcher and wonMatcher(msg) then
+		-- An actual win message -- always means the item is yours now,
+		-- for both a buyout (instant) and, much more rarely, a real bid
+		-- that happened to be the only/final one.
 		self:Success()
+	elseif msg == ERR_AUCTION_BID_PLACED then
+		if self.mode == "buyout" then
+			-- A buyout is placed as a bid mechanically, so this message
+			-- alone already means "bought" for buyout mode (the win
+			-- message above may or may not also fire).
+			self:Success()
+		else
+			-- A real bid was accepted, but that's not a purchase -- you
+			-- don't own the item yet, and might get outbid before the
+			-- auction ends.
+			self:BidPlaced()
+		end
 	end
 end
 
@@ -289,12 +336,33 @@ function Buy:OnUIErrorMessage(msg)
 end
 
 function Buy:Success()
+	-- Usually the deal's own buyoutTotal, but a bid can occasionally win
+	-- outright too (see OnChatMessage) -- if so, what was actually paid
+	-- is whatever bid was armed, not the (possibly nil, for a bid-only
+	-- deal) buyout figure.
+	local paid = (self.mode == "bid") and self.armedMinBid or self.deal.buyoutTotal
+
 	Deals:Remove(self.deal.fingerprint)
 	if Auctionist.Ledger then
-		Auctionist.Ledger:RecordPurchase(Auctionist.PriceDB:ScopeKey(), self.deal)
+		Auctionist.Ledger:RecordPurchase(Auctionist.PriceDB:ScopeKey(), self.deal, paid)
 	end
 	Auctionist.Arbiter:ReleaseControl()
-	self.resultText = "Bought " .. tostring(self.deal.name) .. " for " .. Util.FormatMoney(self.deal.buyoutTotal)
+	self.resultText = "Bought " .. tostring(self.deal.name) .. " for " .. Util.FormatMoney(paid)
+	self.resultOk = true
+	self.state = "DONE"
+	self.resultTime = time()
+end
+
+--- A real (non-buyout) bid was successfully registered -- NOT a purchase.
+-- You don't own the item yet, and might get outbid before the auction
+-- ends (WoW automatically refunds an outbid bid). No Ledger entry, since
+-- nothing is guaranteed won yet; the deal is still removed from the
+-- flagged list since it's already been acted on, just not resolved.
+function Buy:BidPlaced()
+	Deals:Remove(self.deal.fingerprint)
+	Auctionist.Arbiter:ReleaseControl()
+	self.resultText = "Bid placed on " .. tostring(self.deal.name) .. " for " ..
+		Util.FormatMoney(self.armedMinBid) .. ". You'll be notified if you win."
 	self.resultOk = true
 	self.state = "DONE"
 	self.resultTime = time()

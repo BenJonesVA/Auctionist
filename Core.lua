@@ -12,6 +12,7 @@ local PriceDB = Auctionist.PriceDB
 local Scan = Auctionist.Scan
 local Buy = Auctionist.Buy
 local Ledger = Auctionist.Ledger
+local Deals = Auctionist.Deals
 local UI = Auctionist.UI
 
 local Core = CreateFrame("Frame", "AuctionistCoreFrame")
@@ -35,6 +36,11 @@ Core:SetScript("OnEvent", function(self, event, arg1, ...)
 			Ledger:Init()
 		end
 	elseif event == "PLAYER_LOGIN" then
+		-- Deals:Init() (not ADDON_LOADED) -- it needs ScopeKey(), which
+		-- depends on the player's faction; that isn't reliably known until
+		-- around login, and getting it wrong here would restore into (or
+		-- later save under) the wrong realm-faction scope.
+		Deals:Init()
 		UI:Build()
 	elseif event == "AUCTION_HOUSE_SHOW" then
 		UI:Show()
@@ -67,6 +73,7 @@ Core:SetScript("OnUpdate", function(self, elapsed)
 	Buy:OnUpdate(elapsed)
 	PriceDB:OnUpdate(elapsed)
 	Ledger:OnUpdate(elapsed)
+	Deals:OnUpdate(elapsed)
 end)
 
 --------------------------------------------------------------------------
@@ -103,7 +110,10 @@ SlashCmdList["AUCTIONIST"] = function(msg)
 			s.soldCount, s.unsoldCount, Util.FormatMoney(s.unsoldCost)))
 	elseif msg == "ui" or msg == "show" then
 		UI:Toggle()
+	elseif msg == "purgestale" then
+		local removed = Deals:PurgeStale()
+		print(string.format("Auctionist: purged %d stale deal(s).", removed))
 	else
-		print("Auctionist commands: /auctionist scan | fullscan | stop | dbstats | status | pnl | ui")
+		print("Auctionist commands: /auctionist scan | fullscan | stop | dbstats | status | pnl | ui | purgestale")
 	end
 end
