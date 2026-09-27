@@ -90,10 +90,12 @@ local function buildRecord(itemKey, row)
 	local marketValue, confidence, vendorFloor = PriceDB:GetMarketValue(scopeKey, itemKey)
 
 	-- Vendor-price arbitrage is its own always-on check, independent of
-	-- market history/confidence: a buyout at or below what a vendor pays
-	-- is a guaranteed-profit flip the moment you buy it, no resale timing
-	-- risk at all.
-	local isVendorFlip = vendorFloor ~= nil and row.buyoutPerItem <= vendorFloor
+	-- market history/confidence: a buyout below what a vendor pays is a
+	-- guaranteed-profit flip the moment you buy it, no resale timing risk
+	-- at all. Strictly less-than, not less-or-equal -- a buyout exactly
+	-- equal to the vendor price is a real 0-copper-profit break-even, not
+	-- an actual flip, and shouldn't be tagged as one.
+	local isVendorFlip = vendorFloor ~= nil and row.buyoutPerItem < vendorFloor
 
 	-- Minimum bid vs. vendor: informational only. Winning at the opening
 	-- bid isn't guaranteed (someone else can outbid you), and our Buy
@@ -102,7 +104,7 @@ local function buildRecord(itemKey, row)
 	-- list price" request, not a buyable deal on its own.
 	local minBidPerItem = (row.minBid and row.count and row.count > 0)
 		and math.floor(row.minBid / row.count) or nil
-	local isVendorFlipBid = vendorFloor ~= nil and minBidPerItem ~= nil and minBidPerItem <= vendorFloor
+	local isVendorFlipBid = vendorFloor ~= nil and minBidPerItem ~= nil and minBidPerItem < vendorFloor
 
 	local discountPct = marketValue and (1 - (row.buyoutPerItem / (marketValue * AH_CUT))) or nil
 
