@@ -133,7 +133,11 @@ function UI:CreateMainFrame()
 
 	local dealsTabButton = CreateFrame("Button", "AuctionistDealsTabButton", main, "UIPanelButtonTemplate")
 	dealsTabButton:SetSize(100, 22)
-	dealsTabButton:SetPoint("TOPLEFT", titleBar, "BOTTOMLEFT", 0, -4)
+	-- x=8, not 0: lines the tab buttons up directly above Scan Now/Full
+	-- Scan below (which sit 8px inset into `content`, itself already
+	-- 8px inset into `main` the same as titleBar -- so this 8 is the
+	-- extra step to match content's own inset, not titleBar's).
+	dealsTabButton:SetPoint("TOPLEFT", titleBar, "BOTTOMLEFT", 8, -4)
 	dealsTabButton:SetText("Deals")
 	dealsTabButton:SetScript("OnClick", function() UI:SelectPage("deals") end)
 	self.dealsTabButton = dealsTabButton

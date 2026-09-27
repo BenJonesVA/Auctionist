@@ -217,6 +217,26 @@ local function median(sorted)
 	return (sorted[n / 2] + sorted[n / 2 + 1]) / 2
 end
 
+-- Same protection PriceDB.lua applies before committing market-value
+-- history (see its stripHighOutliers): a single ask priced far above the
+-- rest shouldn't be allowed to drag the reference price used below up
+-- with it -- with only 2 "other" listings (the minimum this function ever
+-- sees), a median is just their average, which one overpriced ask can
+-- skew badly on its own.
+local OUTLIER_MULTIPLIER = 4
+
+local function stripHighOutliers(sorted)
+	if #sorted < 3 then return sorted end
+	local m = median(sorted)
+	if not m or m <= 0 then return sorted end
+	local kept = {}
+	for _, p in ipairs(sorted) do
+		if p <= m * OUTLIER_MULTIPLIER then table.insert(kept, p) end
+	end
+	if #kept == 0 then return sorted end
+	return kept
+end
+
 --- Crafting-material peer-price undercut detection: unlike Evaluate()
 -- above (which compares a listing to *historical* market value), this
 -- compares every current listing of an item this scan against each other.
@@ -256,7 +276,7 @@ function Deals:EvaluateMaterialUndercuts(staged, scopeKey)
 				end
 			end
 
-			local reference = median(rest)
+			local reference = median(stripHighOutliers(rest))
 			if reference and reference > 0 then
 				local discount = 1 - (cheapestRow.buyoutPerItem / reference)
 				if discount >= MATERIAL_UNDERCUT_DISCOUNT then

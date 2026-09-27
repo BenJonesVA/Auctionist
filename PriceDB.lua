@@ -97,6 +97,55 @@ local function computePercentile(sortedPrices, pct)
 	return sortedPrices[idx]
 end
 
+-- A lone ask priced far above every other current listing of the same
+-- item is far more likely to be a seller who mis-priced (or is squatting
+-- on) their auction than a genuine shift in the item's value. Left in,
+-- even a single such listing can single-handedly become an item's entire
+-- p10/market-value estimate (especially for a rarely-listed item), which
+-- then makes a completely unrelated, legitimately-priced stack of the
+-- same item look like an enormous "deal" against a price nobody is
+-- actually paying. Needs at least this many concurrent listings to have
+-- any real basis for comparison -- with only 1-2 prices, there's no way
+-- to tell a genuine price from an outlier, so nothing is stripped.
+local OUTLIER_MIN_SAMPLES = 3
+-- More than this many times the sample's own median counts as an outlier.
+local OUTLIER_MULTIPLIER = 4
+
+local function medianOf(sortedPrices)
+	local n = #sortedPrices
+	if n == 0 then return nil end
+	if n % 2 == 1 then return sortedPrices[(n + 1) / 2] end
+	return (sortedPrices[n / 2] + sortedPrices[n / 2 + 1]) / 2
+end
+
+--- Strips high-side price outliers from an already-sorted price list
+-- before it's used to compute a day's p10/min/n. Returns the (possibly
+-- shorter) surviving list and how many prices were stripped (0 if none,
+-- or if there weren't enough samples to judge). Never strips everything
+-- -- if every price is somehow "an outlier" relative to the median, that
+-- median itself isn't a trustworthy baseline, so the original list is
+-- kept as-is rather than committing an empty day.
+local function stripHighOutliers(sortedPrices)
+	if #sortedPrices < OUTLIER_MIN_SAMPLES then
+		return sortedPrices, 0
+	end
+
+	local median = medianOf(sortedPrices)
+	if not median or median <= 0 then return sortedPrices, 0 end
+
+	local kept = {}
+	for _, p in ipairs(sortedPrices) do
+		if p <= median * OUTLIER_MULTIPLIER then
+			table.insert(kept, p)
+		end
+	end
+
+	if #kept == 0 or #kept == #sortedPrices then
+		return sortedPrices, 0
+	end
+	return kept, #sortedPrices - #kept
+end
+
 --- Merge a freshly-committed day-bucket with whatever was already recorded
 -- for that item today. Raw prices from an earlier commit this same day
 -- aren't kept around (that would defeat the point of condensing at all),
@@ -127,6 +176,13 @@ function PriceDB:Commit(scopeKey, staged, dayKey)
 		if prices and #prices > 0 then
 			table.sort(prices)
 
+			local kept, stripped = stripHighOutliers(prices)
+			if stripped > 0 then
+				print(string.format(
+					"Auctionist: ignored %d insanely overpriced listing%s of %s when updating its market value.",
+					stripped, stripped > 1 and "s" or "", data.name or "?"))
+			end
+
 			local item = self:GetItemEntry(scopeKey, itemKey, true)
 			item.itemID = data.itemID
 			item.suffixID = data.suffixID
@@ -135,7 +191,7 @@ function PriceDB:Commit(scopeKey, staged, dayKey)
 			item.lastSeen = now
 
 			item.days[dayKey] = mergeDayBucket(item.days[dayKey],
-				computePercentile(prices, 0.10), prices[1], #prices)
+				computePercentile(kept, 0.10), kept[1], #kept)
 		end
 	end
 end
