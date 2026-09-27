@@ -1,0 +1,14 @@
+## Interface: 30300
+## Title: Auctionist
+## Notes: Scans the Auction House, tracks historical prices, flags underpriced auctions, and lets you buy them to resell.
+## Author: Ben
+## Version: 0.1.0
+## SavedVariables: AuctionistDB
+
+Util.lua
+PriceDB.lua
+Deals.lua
+Scan.lua
+Buy.lua
+UI.lua
+Core.lua

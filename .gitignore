@@ -1,0 +1,10 @@
+# Claude Code project state - local to this machine, not part of the addon
+.claude/
+CLAUDE.md
+
+# Reference material used to design the addon - not part of the addon itself
+learning material/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
