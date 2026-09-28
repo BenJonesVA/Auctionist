@@ -8,6 +8,7 @@
 Util.lua
 PriceDB.lua
 Deals.lua
+Excessive.lua
 Scan.lua
 Buy.lua
 Ledger.lua

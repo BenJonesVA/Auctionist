@@ -23,6 +23,7 @@ local _, Auctionist = ...
 local Util = Auctionist.Util
 local Deals = Auctionist.Deals
 local Ledger = Auctionist.Ledger
+local Excessive = Auctionist.Excessive
 
 local UI = {}
 Auctionist.UI = UI
@@ -30,7 +31,10 @@ Auctionist.UI = UI
 local ROW_HEIGHT = 18
 local VISIBLE_ROWS = 20
 
-local MAIN_WIDTH, MAIN_HEIGHT = 760, 520
+-- Widened from 760 to fit separate Buyout/Bid profit columns without
+-- wrapping (see CreateDealsPanel's column layout) -- Bid Profit needs room
+-- for the longest case, e.g. "12g 34s 56c (if won)".
+local MAIN_WIDTH, MAIN_HEIGHT = 960, 520
 local MIN_WIDTH, MIN_HEIGHT = 600, 400
 local MAX_WIDTH, MAX_HEIGHT = 1100, 800
 
@@ -65,7 +69,8 @@ local DEAL_SORT_EXTRACTORS = {
 		end
 		return nil
 	end,
-	profit = function(d) return d.buyoutQualifies and d.potentialProfit or d.bidPotentialProfit end,
+	buyoutProfit = function(d) return d.buyoutQualifies and d.potentialProfit or nil end,
+	bidProfit = function(d) return d.bidQualifies and d.bidPotentialProfit or nil end,
 }
 
 local LEDGER_SORT_EXTRACTORS = {
@@ -73,6 +78,14 @@ local LEDGER_SORT_EXTRACTORS = {
 	cost = function(e) return e.cost end,
 	sale = function(e) return (e.status == "sold" or e.status == "vendored") and e.saleAmount or nil end,
 	profit = function(e) return (e.status == "sold" or e.status == "vendored") and (e.saleAmount - e.cost) or nil end,
+}
+
+local EXCESSIVE_SORT_EXTRACTORS = {
+	name = function(r) return r.name and r.name:lower() or nil end,
+	count = function(r) return r.count end,
+	buyoutTotal = function(r) return r.buyoutTotal end,
+	marketValue = function(r) return r.marketValue end,
+	multiple = function(r) return r.multiple end,
 }
 
 --------------------------------------------------------------------------
@@ -87,6 +100,7 @@ function UI:Build()
 	self:CreateMainFrame()
 	self:CreateDealsPanel()
 	self:CreateLedgerPanel()
+	self:CreateExcessivePanel()
 	self:SelectPage("deals")
 	self:CreateBuyDialog()
 	self:CreateMinimapButton()
@@ -155,6 +169,13 @@ function UI:CreateMainFrame()
 	ledgerTabButton:SetScript("OnClick", function() UI:SelectPage("ledger") end)
 	self.ledgerTabButton = ledgerTabButton
 
+	local excessiveTabButton = CreateFrame("Button", "AuctionistExcessiveTabButton", main, "UIPanelButtonTemplate")
+	excessiveTabButton:SetSize(100, 22)
+	excessiveTabButton:SetPoint("LEFT", ledgerTabButton, "RIGHT", 16, 0)
+	excessiveTabButton:SetText("Excessive")
+	excessiveTabButton:SetScript("OnClick", function() UI:SelectPage("excessive") end)
+	self.excessiveTabButton = excessiveTabButton
+
 	local content = CreateFrame("Frame", nil, main)
 	content:SetPoint("TOPLEFT", main, "TOPLEFT", 8, -CONTENT_TOP_INSET)
 	content:SetPoint("BOTTOMRIGHT", main, "BOTTOMRIGHT", -8, 8)
@@ -207,8 +228,10 @@ function UI:SelectPage(pageName)
 	self.activePage = pageName
 	if pageName == "deals" then self.dealsPage:Show() else self.dealsPage:Hide() end
 	if pageName == "ledger" then self.ledgerPage:Show() else self.ledgerPage:Hide() end
+	if pageName == "excessive" then self.excessivePage:Show() else self.excessivePage:Hide() end
 	if pageName == "deals" then self.dealsTabButton:Disable() else self.dealsTabButton:Enable() end
 	if pageName == "ledger" then self.ledgerTabButton:Disable() else self.ledgerTabButton:Enable() end
+	if pageName == "excessive" then self.excessiveTabButton:Disable() else self.excessiveTabButton:Enable() end
 end
 
 function UI:Show()
@@ -316,6 +339,7 @@ function UI:CreateDealsPanel()
 	scanBtn:SetScript("OnClick", function()
 		local filters = {}
 		if UI.selectedClassIndex then filters.classIndex = UI.selectedClassIndex end
+		if UI.selectedSubclassIndex then filters.subclassIndex = UI.selectedSubclassIndex end
 		Auctionist.Scan:StartPaged(filters)
 	end)
 	self.scanButton = scanBtn
@@ -334,8 +358,39 @@ function UI:CreateDealsPanel()
 	stopBtn:SetScript("OnClick", function() Auctionist.Scan:Stop() end)
 	self.stopButton = stopBtn
 
+	-- Item-name search: a filtered Scan Now under the hood (same
+	-- StartPaged(filters) path, just with f.name set), so it still requires
+	-- being at an auctioneer and still respects the category/subcategory
+	-- dropdowns if one's set -- a separate button rather than folding into
+	-- Scan Now itself since typing a name and clicking a distinct "Search"
+	-- is the more obvious affordance.
+	local searchBox = CreateFrame("EditBox", "AuctionistSearchBox", panel, "InputBoxTemplate")
+	searchBox:SetSize(90, 20)
+	searchBox:SetPoint("LEFT", stopBtn, "RIGHT", 20, -1)
+	searchBox:SetAutoFocus(false)
+	searchBox:SetMaxLetters(50)
+	self.searchBox = searchBox
+
+	local searchBtn = CreateFrame("Button", "AuctionistSearchButton", panel, "UIPanelButtonTemplate")
+	searchBtn:SetSize(60, 22)
+	searchBtn:SetPoint("LEFT", searchBox, "RIGHT", 4, 1)
+	searchBtn:SetText("Search")
+	searchBtn:SetScript("OnClick", function()
+		local text = searchBox:GetText()
+		local filters = {}
+		if text and text ~= "" then filters.name = text end
+		if UI.selectedClassIndex then filters.classIndex = UI.selectedClassIndex end
+		if UI.selectedSubclassIndex then filters.subclassIndex = UI.selectedSubclassIndex end
+		Auctionist.Scan:StartPaged(filters)
+		searchBox:ClearFocus()
+	end)
+	self.searchButton = searchBtn
+
+	searchBox:SetScript("OnEnterPressed", function() searchBtn:Click() end)
+	searchBox:SetScript("OnEscapePressed", function(box) box:ClearFocus() end)
+
 	local status = panel:CreateFontString("AuctionistStatusText", "ARTWORK", "GameFontNormalSmall")
-	status:SetPoint("LEFT", stopBtn, "RIGHT", 16, 0)
+	status:SetPoint("LEFT", searchBtn, "RIGHT", 16, 0)
 	status:SetPoint("RIGHT", panel, "RIGHT", 0, 0)
 	status:SetJustifyH("LEFT")
 	self.statusText = status
@@ -363,8 +418,8 @@ function UI:CreateDealsPanel()
 	end)
 	self.purgeStaleButton = purgeBtn
 
-	-- Category filter: top-level categories only (e.g. "Trade Goods",
-	-- "Armor"), not the full subclass tree -- Scan Now only, since a
+	-- Category filter: top-level categories (e.g. "Trade Goods", "Armor")
+	-- plus an optional subcategory drill-down -- Scan Now only, since a
 	-- getAll (Full Scan) always sweeps the whole AH by design/API
 	-- constraint and can't be class-filtered. Scan:Finish() already skips
 	-- the auto stale-sweep for any filtered scan (see Scan.lua), so using
@@ -374,10 +429,36 @@ function UI:CreateDealsPanel()
 	UIDropDownMenu_SetWidth(categoryDropdown, 130)
 	UIDropDownMenu_SetText(categoryDropdown, "All Categories")
 
+	-- Subcategory is optional and only meaningful once a top-level category
+	-- is picked (QueryAuctionItems ignores a subclassIndex without a
+	-- matching classIndex), so it starts disabled/reset and only offers
+	-- entries for the currently-selected class.
+	local subcategoryDropdown = CreateFrame("Frame", "AuctionistSubcategoryDropdown", panel, "UIDropDownMenuTemplate")
+	subcategoryDropdown:SetPoint("LEFT", categoryDropdown, "RIGHT", -8, 0)
+	UIDropDownMenu_SetWidth(subcategoryDropdown, 130)
+	UIDropDownMenu_SetText(subcategoryDropdown, "All Subcategories")
+
+	local function OnSubcategorySelect(entrySelf)
+		UI.selectedSubclassIndex = entrySelf.value
+		UIDropDownMenu_SetText(subcategoryDropdown, entrySelf:GetText())
+		CloseDropDownMenus()
+	end
+
+	local function ResetSubcategoryDropdown()
+		UI.selectedSubclassIndex = nil
+		UIDropDownMenu_SetText(subcategoryDropdown, "All Subcategories")
+		if UI.selectedClassIndex then
+			UIDropDownMenu_EnableDropDown(subcategoryDropdown)
+		else
+			UIDropDownMenu_DisableDropDown(subcategoryDropdown)
+		end
+	end
+
 	local function OnCategorySelect(entrySelf)
 		UI.selectedClassIndex = entrySelf.value
 		UIDropDownMenu_SetText(categoryDropdown, entrySelf:GetText())
 		CloseDropDownMenus()
+		ResetSubcategoryDropdown()
 	end
 
 	UIDropDownMenu_Initialize(categoryDropdown, function()
@@ -401,14 +482,38 @@ function UI:CreateDealsPanel()
 	end)
 	self.categoryDropdown = categoryDropdown
 
+	UIDropDownMenu_Initialize(subcategoryDropdown, function()
+		local info = UIDropDownMenu_CreateInfo()
+		info.text = "All Subcategories"
+		info.value = nil
+		info.func = OnSubcategorySelect
+		UIDropDownMenu_AddButton(info)
+
+		if UI.selectedClassIndex then
+			-- Same 1-based-position-as-index assumption as the top-level
+			-- class list above, applied to GetAuctionItemSubClasses --
+			-- unverified in-game like the rest of this dropdown's offsets.
+			for i, name in ipairs({ GetAuctionItemSubClasses(UI.selectedClassIndex) }) do
+				info = UIDropDownMenu_CreateInfo()
+				info.text = name
+				info.value = i
+				info.func = OnSubcategorySelect
+				UIDropDownMenu_AddButton(info)
+			end
+		end
+	end)
+	ResetSubcategoryDropdown()
+	self.subcategoryDropdown = subcategoryDropdown
+
 	self.dealsSortState = {}
 	self:CreateColumnHeader(panel, -58, {
 		{ x = 22, width = 220, text = "Item", key = "name" },
 		{ x = 246, width = 30, text = "Qty", key = "count" },
 		{ x = 280, width = 100, text = "Buyout", key = "buyoutTotal" },
 		{ x = 384, width = 90, text = "Deal", key = "deal" },
-		{ x = 478, width = 150, text = "Potential Profit", key = "profit" },
-		{ x = 640, width = 50, text = "Age" },
+		{ x = 478, width = 110, text = "Buyout Profit", key = "buyoutProfit" },
+		{ x = 592, width = 140, text = "Bid Profit", key = "bidProfit" },
+		{ x = 736, width = 40, text = "Age" },
 	}, self.dealsSortState, function() UI:Redisplay() end)
 
 	local scrollFrame = CreateFrame("ScrollFrame", "AuctionistScrollFrame", panel, "FauxScrollFrameTemplate")
@@ -534,14 +639,23 @@ function UI:CreateRow(parent, index, scrollFrame)
 	row.discount:SetWidth(90)
 	row.discount:SetJustifyH("LEFT")
 
-	row.profit = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-	row.profit:SetPoint("LEFT", row.discount, "RIGHT", 4, 0)
-	row.profit:SetWidth(100)
-	row.profit:SetJustifyH("LEFT")
+	-- Buyout and bid are independent qualifying paths (see Deals.lua), so a
+	-- row can offer both at once with different profit figures -- separate
+	-- columns rather than cramming both into one field (which used to wrap
+	-- onto a second line and bleed into the row below).
+	row.buyoutProfit = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.buyoutProfit:SetPoint("LEFT", row.discount, "RIGHT", 4, 0)
+	row.buyoutProfit:SetWidth(110)
+	row.buyoutProfit:SetJustifyH("LEFT")
+
+	row.bidProfit = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.bidProfit:SetPoint("LEFT", row.buyoutProfit, "RIGHT", 4, 0)
+	row.bidProfit:SetWidth(140)
+	row.bidProfit:SetJustifyH("LEFT")
 
 	row.stale = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-	row.stale:SetPoint("LEFT", row.profit, "RIGHT", 4, 0)
-	row.stale:SetWidth(50)
+	row.stale:SetPoint("LEFT", row.bidProfit, "RIGHT", 4, 0)
+	row.stale:SetWidth(40)
 	row.stale:SetJustifyH("LEFT")
 
 	-- Two independent buttons, not one: a listing can qualify as a deal
@@ -586,6 +700,7 @@ function UI:OnPanelUpdate(elapsed)
 
 	if scanBusy or not canQuery then self.scanButton:Disable() else self.scanButton:Enable() end
 	if scanBusy or not canGetAll then self.getAllButton:Disable() else self.getAllButton:Enable() end
+	if scanBusy or not canQuery then self.searchButton:Disable() else self.searchButton:Enable() end
 	if scanBusy then self.stopButton:Enable() else self.stopButton:Disable() end
 
 	local flaggedCount = #Deals:GetFlagged()
@@ -654,8 +769,6 @@ function UI:Redisplay()
 					row.discount:SetText("vendor")
 					row.discount:SetTextColor(1, 1, 1)
 				end
-				row.profit:SetText(Util.FormatMoney(deal.potentialProfit))
-				row.profit:SetTextColor(0.15, 1, 0.15)
 			elseif deal.bidQualifies then
 				-- No buyout deal here (or its buyout isn't attractive), but
 				-- the current minimum bid is -- distinctly colored and
@@ -668,13 +781,28 @@ function UI:Redisplay()
 						math.floor((deal.bidDiscountPct or 0) * 100 + 0.5)))
 				end
 				row.discount:SetTextColor(0.4, 0.7, 1)
-				row.profit:SetText(Util.FormatMoney(deal.bidPotentialProfit) .. " (if won)")
-				row.profit:SetTextColor(0.4, 0.7, 1)
 			else
 				row.discount:SetText("-")
 				row.discount:SetTextColor(1, 1, 1)
-				row.profit:SetText("-")
-				row.profit:SetTextColor(1, 1, 1)
+			end
+
+			-- Buyout and bid are independent qualifying paths (see
+			-- Deals.lua) with their own dedicated columns, so a row can show
+			-- both profit figures at once instead of one hiding the other.
+			if deal.buyoutQualifies then
+				row.buyoutProfit:SetText(Util.FormatMoney(deal.potentialProfit))
+				row.buyoutProfit:SetTextColor(0.15, 1, 0.15)
+			else
+				row.buyoutProfit:SetText("-")
+				row.buyoutProfit:SetTextColor(1, 1, 1)
+			end
+
+			if deal.bidQualifies then
+				row.bidProfit:SetText(Util.FormatMoney(deal.bidPotentialProfit) .. " (if won)")
+				row.bidProfit:SetTextColor(0.4, 0.7, 1)
+			else
+				row.bidProfit:SetText("-")
+				row.bidProfit:SetTextColor(1, 1, 1)
 			end
 
 			if Deals:IsStale(deal) then
@@ -842,6 +970,136 @@ function UI:RedisplayLedger()
 				row.profit:SetText("-")
 				row.profit:SetTextColor(1, 1, 1)
 			end
+			row:Show()
+		else
+			row:Hide()
+		end
+	end
+end
+
+--------------------------------------------------------------------------
+-- Excessive page: listings priced far above known market value (see
+-- Excessive.lua) -- informational only, no buy actions, since these are
+-- exactly the auctions NOT worth buying.
+--------------------------------------------------------------------------
+
+function UI:CreateExcessivePanel()
+	local panel = CreateFrame("Frame", nil, self.content)
+	panel:SetAllPoints(self.content)
+	self.excessivePage = panel
+
+	local note = panel:CreateFontString("AuctionistExcessiveNoteText", "ARTWORK", "GameFontNormalSmall")
+	note:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, -10)
+	note:SetPoint("RIGHT", panel, "RIGHT", 0, 0)
+	note:SetJustifyH("LEFT")
+	note:SetText("Listings priced 4x+ above known market value -- likely one seller's outrageous ask, not a real price.")
+	self.excessiveNoteText = note
+
+	self.excessiveSortState = {}
+	self:CreateColumnHeader(panel, -34, {
+		{ x = 22, width = 220, text = "Item", key = "name" },
+		{ x = 246, width = 30, text = "Qty", key = "count" },
+		{ x = 280, width = 100, text = "Buyout", key = "buyoutTotal" },
+		{ x = 384, width = 100, text = "Market Value", key = "marketValue" },
+		{ x = 488, width = 80, text = "Multiple", key = "multiple" },
+	}, self.excessiveSortState, function() UI:RedisplayExcessive() end)
+
+	local scrollFrame = CreateFrame("ScrollFrame", "AuctionistExcessiveScrollFrame", panel, "FauxScrollFrameTemplate")
+	scrollFrame:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, -34 - ROW_HEIGHT)
+	scrollFrame:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -24, 0)
+	scrollFrame:SetScript("OnVerticalScroll", function(scrollSelf, offset)
+		FauxScrollFrame_OnVerticalScroll(scrollSelf, offset, ROW_HEIGHT, function() UI:RedisplayExcessive() end)
+	end)
+	self.excessiveScrollFrame = scrollFrame
+
+	self.excessiveRows = {}
+	for i = 1, VISIBLE_ROWS do
+		self.excessiveRows[i] = self:CreateExcessiveRow(panel, i, scrollFrame)
+	end
+
+	panel:SetScript("OnUpdate", function(_, elapsed) UI:OnExcessivePanelUpdate(elapsed) end)
+end
+
+function UI:CreateExcessiveRow(parent, index, scrollFrame)
+	local row = CreateFrame("Frame", "AuctionistExcessiveRow" .. index, parent)
+	row:SetHeight(ROW_HEIGHT)
+	row:SetPoint("TOPLEFT", scrollFrame, "TOPLEFT", 0, -(index - 1) * ROW_HEIGHT)
+	row:SetPoint("RIGHT", scrollFrame, "RIGHT", 0, 0)
+
+	row.icon = row:CreateTexture(nil, "ARTWORK")
+	row.icon:SetSize(ROW_HEIGHT - 2, ROW_HEIGHT - 2)
+	row.icon:SetPoint("LEFT", row, "LEFT", 2, 0)
+
+	row.name = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.name:SetPoint("LEFT", row.icon, "RIGHT", 4, 0)
+	row.name:SetWidth(220)
+	row.name:SetJustifyH("LEFT")
+
+	row.count = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.count:SetPoint("LEFT", row.name, "RIGHT", 4, 0)
+	row.count:SetWidth(30)
+
+	row.buyoutTotal = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.buyoutTotal:SetPoint("LEFT", row.count, "RIGHT", 4, 0)
+	row.buyoutTotal:SetWidth(100)
+	row.buyoutTotal:SetJustifyH("LEFT")
+
+	row.marketValue = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.marketValue:SetPoint("LEFT", row.buyoutTotal, "RIGHT", 4, 0)
+	row.marketValue:SetWidth(100)
+	row.marketValue:SetJustifyH("LEFT")
+
+	row.multiple = row:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	row.multiple:SetPoint("LEFT", row.marketValue, "RIGHT", 4, 0)
+	row.multiple:SetWidth(80)
+	row.multiple:SetJustifyH("LEFT")
+
+	row:Hide()
+	return row
+end
+
+function UI:OnExcessivePanelUpdate(elapsed)
+	self.excessiveUpdateElapsed = (self.excessiveUpdateElapsed or 0) + elapsed
+	if self.excessiveUpdateElapsed < 0.5 then return end
+	self.excessiveUpdateElapsed = 0
+
+	local count = #Excessive:GetFlagged()
+	if count ~= self.lastExcessiveCount then
+		self.lastExcessiveCount = count
+		self:RedisplayExcessive()
+	end
+end
+
+function UI:RedisplayExcessive()
+	local list = Excessive:GetFlagged()
+
+	local sortState = self.excessiveSortState
+	if sortState.key then
+		local sorted = {}
+		for i, record in ipairs(list) do sorted[i] = record end
+		local extractor = EXCESSIVE_SORT_EXTRACTORS[sortState.key]
+		local ascending = sortState.ascending
+		table.sort(sorted, function(a, b)
+			return compareSortValues(extractor(a), extractor(b), ascending)
+		end)
+		list = sorted
+	end
+
+	FauxScrollFrame_Update(self.excessiveScrollFrame, #list, VISIBLE_ROWS, ROW_HEIGHT)
+	local offset = FauxScrollFrame_GetOffset(self.excessiveScrollFrame)
+
+	for i = 1, VISIBLE_ROWS do
+		local row = self.excessiveRows[i]
+		local record = list[offset + i]
+
+		if record then
+			row.icon:SetTexture(record.iconTexture)
+			row.name:SetText(record.name or "?")
+			row.count:SetText(tostring(record.count))
+			row.buyoutTotal:SetText(Util.FormatMoney(record.buyoutTotal))
+			row.marketValue:SetText(Util.FormatMoney(record.marketValue))
+			row.multiple:SetText(string.format("%.1fx", record.multiple or 0))
+			row.multiple:SetTextColor(1, 0.3, 0.3)
 			row:Show()
 		else
 			row:Hide()

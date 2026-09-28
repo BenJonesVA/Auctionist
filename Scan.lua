@@ -13,6 +13,7 @@ local _, Auctionist = ...
 local Util = Auctionist.Util
 local PriceDB = Auctionist.PriceDB
 local Deals = Auctionist.Deals
+local Excessive = Auctionist.Excessive
 
 local Scan = {}
 Auctionist.Scan = Scan
@@ -384,13 +385,15 @@ function Scan:DoStagePage()
 					end
 				end
 
-				Deals:Evaluate({
+				local evalRow = {
 					itemID = itemID, suffixID = suffixID, link = row.link,
 					name = row.name, iconTexture = row.iconTexture,
 					count = row.count, buyoutPerItem = unitPrice,
 					buyoutTotal = hasBuyout and row.buyoutPrice or nil,
 					owner = row.owner, minBid = nextBid,
-				})
+				}
+				Deals:Evaluate(evalRow)
+				Excessive:Evaluate(evalRow)
 
 				self.stats.rowsAccepted = self.stats.rowsAccepted + 1
 			end
@@ -431,6 +434,7 @@ function Scan:Finish()
 	-- anything outside it is gone.
 	if not next(self.filters) then
 		Deals:RemoveUnconfirmed(self.startedAt)
+		Excessive:RemoveUnconfirmed(self.startedAt)
 	end
 
 	self.stats.lastScanTime = time()
