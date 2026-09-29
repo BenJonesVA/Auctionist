@@ -262,6 +262,8 @@ local function buildRecord(itemKey, row)
 		vendorFloor = vendorFloor,
 		isVendorFlip = isVendorFlip,
 		isVendorFlipBid = isVendorFlipBid,
+		scanClassIndex = row.scanClassIndex,
+		scanSubclassIndex = row.scanSubclassIndex,
 	}
 end
 
@@ -378,6 +380,8 @@ function Deals:Evaluate(row)
 		existing.bidQualifies = bidQualifies
 		existing.potentialProfit = potentialProfit
 		existing.bidPotentialProfit = bidPotentialProfit
+		existing.scanClassIndex = record.scanClassIndex
+		existing.scanSubclassIndex = record.scanSubclassIndex
 		existing.seenAt = time()
 		self.version = self.version + 1
 		return
@@ -428,6 +432,8 @@ function Deals:FlagMaterialUndercut(row, peerReferencePrice, peerDiscountPct)
 	record.peerDiscountPct = peerDiscountPct
 	record.buyoutQualifies = true
 	record.potentialProfit = profit
+	record.scanClassIndex = candidate.scanClassIndex
+	record.scanSubclassIndex = candidate.scanSubclassIndex
 	record.seenAt = time()
 	self.version = self.version + 1
 end

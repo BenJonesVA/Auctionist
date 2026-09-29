@@ -249,14 +249,10 @@ end
 --------------------------------------------------------------------------
 -- Minimap button
 --
--- Left-click always toggles this addon's own window. It also, as a
--- best-effort extra, calls InteractUnit("target") -- the same trick
--- "interact" macros have used since Vanilla to open a vendor's/
--- auctioneer's/mailbox's window from within interact range without
--- walking up and right-clicking them again. This only does anything
--- useful if your current target actually IS the auctioneer and you're in
--- range; otherwise it's a harmless no-op (wrapped in pcall in case the
--- target isn't interactable at all).
+-- Left-click toggles this addon's own window. (An earlier version also
+-- called InteractUnit("target") as a "reopen the auctioneer" shortcut --
+-- removed, since InteractUnit can only be called by Blizzard's default
+-- UI and always throws a blocked-action error from an addon.)
 --------------------------------------------------------------------------
 
 local MINIMAP_BUTTON_RADIUS = 80
@@ -306,16 +302,12 @@ function UI:CreateMinimapButton()
 
 	button:SetScript("OnClick", function()
 		UI:Toggle()
-		if UnitExists("target") and UnitIsFriend("player", "target") then
-			pcall(InteractUnit, "target")
-		end
 	end)
 
 	button:SetScript("OnEnter", function(tipOwner)
 		GameTooltip:SetOwner(tipOwner, "ANCHOR_LEFT")
 		GameTooltip:AddLine("Auctionist")
 		GameTooltip:AddLine("Left-click: toggle window", 1, 1, 1)
-		GameTooltip:AddLine("If your target is the auctioneer and you're in range, this also opens the Auction House.", 0.7, 0.7, 0.7, true)
 		GameTooltip:Show()
 	end)
 	button:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -442,6 +434,8 @@ function UI:CreateDealsPanel()
 		UI.selectedSubclassIndex = entrySelf.value
 		UIDropDownMenu_SetText(subcategoryDropdown, entrySelf:GetText())
 		CloseDropDownMenus()
+		UI:Redisplay()
+		UI:RedisplayExcessive()
 	end
 
 	local function ResetSubcategoryDropdown()
@@ -459,6 +453,8 @@ function UI:CreateDealsPanel()
 		UIDropDownMenu_SetText(categoryDropdown, entrySelf:GetText())
 		CloseDropDownMenus()
 		ResetSubcategoryDropdown()
+		UI:Redisplay()
+		UI:RedisplayExcessive()
 	end
 
 	UIDropDownMenu_Initialize(categoryDropdown, function()
@@ -712,6 +708,24 @@ end
 
 function UI:Redisplay()
 	local list = Deals:GetFlagged()
+
+	-- A selected category/subcategory only ever restricted what a NEW scan
+	-- asked the AH for -- it never pruned deals already flagged from a
+	-- broader (or differently-filtered) earlier scan, which made the
+	-- dropdown look like it did nothing. Filter the display itself too, by
+	-- the category each deal's own scan was restricted to (nil -- i.e. an
+	-- unfiltered Scan Now or a getAll Full Scan -- never matches a selected
+	-- category, so those need a re-scan under that filter to show here).
+	if UI.selectedClassIndex then
+		local filtered = {}
+		for _, deal in ipairs(list) do
+			if deal.scanClassIndex == UI.selectedClassIndex
+				and (not UI.selectedSubclassIndex or deal.scanSubclassIndex == UI.selectedSubclassIndex) then
+				table.insert(filtered, deal)
+			end
+		end
+		list = filtered
+	end
 
 	if self.vendorFlipsOnly then
 		local filtered = {}
@@ -1072,6 +1086,21 @@ end
 
 function UI:RedisplayExcessive()
 	local list = Excessive:GetFlagged()
+
+	-- Same category-dropdown display filter as the Deals tab (see
+	-- UI:Redisplay) -- the dropdown lives on the Deals toolbar but restricts
+	-- what any scan searches for regardless of which tab is open, so it
+	-- should filter this tab's display too.
+	if UI.selectedClassIndex then
+		local filtered = {}
+		for _, record in ipairs(list) do
+			if record.scanClassIndex == UI.selectedClassIndex
+				and (not UI.selectedSubclassIndex or record.scanSubclassIndex == UI.selectedSubclassIndex) then
+				table.insert(filtered, record)
+			end
+		end
+		list = filtered
+	end
 
 	local sortState = self.excessiveSortState
 	if sortState.key then

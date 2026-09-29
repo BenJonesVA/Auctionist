@@ -69,6 +69,8 @@ function Excessive:Evaluate(row)
 	record.buyoutTotal = row.buyoutTotal
 	record.marketValue = marketValue
 	record.multiple = row.buyoutPerItem / marketValue
+	record.scanClassIndex = row.scanClassIndex
+	record.scanSubclassIndex = row.scanSubclassIndex
 	record.seenAt = time()
 
 	if not existing then

@@ -381,6 +381,8 @@ function Scan:DoStagePage()
 							name = row.name, iconTexture = row.iconTexture, count = row.count,
 							buyoutPerItem = unitPrice, buyoutTotal = row.buyoutPrice,
 							owner = row.owner, minBid = nextBid,
+							scanClassIndex = self.filters.classIndex,
+							scanSubclassIndex = self.filters.subclassIndex,
 						}
 					end
 				end
@@ -391,6 +393,12 @@ function Scan:DoStagePage()
 					count = row.count, buyoutPerItem = unitPrice,
 					buyoutTotal = hasBuyout and row.buyoutPrice or nil,
 					owner = row.owner, minBid = nextBid,
+					-- The category the *scan itself* was restricted to (nil for
+					-- an unfiltered Scan Now or a getAll Full Scan) -- lets the
+					-- UI's category dropdown also filter the already-flagged
+					-- list, not just what a new scan searches the AH for.
+					scanClassIndex = self.filters.classIndex,
+					scanSubclassIndex = self.filters.subclassIndex,
 				}
 				Deals:Evaluate(evalRow)
 				Excessive:Evaluate(evalRow)
